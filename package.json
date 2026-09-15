@@ -1,0 +1,65 @@
+{
+  "name": "@swapai/core",
+  "version": "0.1.0",
+  "description": "Replace paid classifiers with locally trained Needle 2 classifiers.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smccamley/swapai.git"
+  },
+  "homepage": "https://stuartmccamley.com/swapai",
+  "sideEffects": false,
+  "bugs": {
+    "url": "https://github.com/smccamley/swapai/issues"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "files": [
+    "dist",
+    "python",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./effect": {
+      "types": "./dist/effect.d.ts",
+      "import": "./dist/effect.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run --exclude test/needle.real.test.ts",
+    "test:real": "vitest run test/needle.real.test.ts --testTimeout=1800000",
+    "test:watch": "vitest",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "peerDependencies": {
+    "effect": "^3.22.0"
+  },
+  "peerDependenciesMeta": {
+    "effect": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "effect": "^3.22.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  }
+}

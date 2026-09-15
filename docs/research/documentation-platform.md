@@ -1,25 +1,30 @@
 # SwapAI documentation platform
 
-**Decision:** use **Fumadocs** in the SwapAI repository and publish a static build at `https://stuartmccamley.com/swapai`.
+**Decision:** use **Fumadocs** in the `stuartmccamley.com` repository and publish it at `https://stuartmccamley.com/swapai`.
 
 Fumadocs is the best fit because SwapAI is a TypeScript npm library, its documentation will be mostly code examples, and the existing website already uses Next.js 16, React 19 and Tailwind 4. Current Fumadocs package metadata targets Next.js 16 and React 19.2, while its official CLI supports both existing Next applications and a static-export template. Its code blocks provide Shiki highlighting, titles and copy buttons; tabs can persist and synchronise a reader's choice; Twoslash can show real TypeScript types and errors. It also provides local Orama search, same-site versioning and source-level UI control under an MIT licence. [CLI](https://www.fumadocs.dev/docs/cli), [static build](https://www.fumadocs.dev/docs/deploying/static), [code blocks](https://www.fumadocs.dev/docs/ui/components/codeblock), [tabs](https://www.fumadocs.dev/docs/ui/components/tabs), [Twoslash](https://www.fumadocs.dev/docs/markdown/twoslash), [search](https://www.fumadocs.dev/docs/headless/search/orama), [versioning](https://www.fumadocs.dev/docs/navigation), [customisation](https://www.fumadocs.dev/docs/guides/customize-ui), [licence](https://github.com/fuma-nama/fumadocs/blob/dev/LICENSE), [npm package](https://www.npmjs.com/package/fumadocs-ui)
 
 ## Recommended deployment
 
-Keep the docs source with the package, for example under `apps/docs`, rather than coupling documentation changes to the currently dirty `stuartmccamley.com` repository.
+Keep the package source in this repository. Put the public Fumadocs application in
+`/Users/stuart/workspace/stuartmccamley.com/packages/swapai-docs`, using a clean
+worktree so unrelated edits in the primary website checkout remain untouched.
 
 Configure the docs build with:
 
 ```ts
 const nextConfig = {
   basePath: "/swapai",
-  output: "export",
 };
 ```
 
-Next.js applies `basePath` to pages and assets at build time, and Fumadocs supports static output plus a browser-side search index. Serve the exported files from a small static container and proxy `/swapai` and `/swapai/*` to it. This matches the existing site's use of path rewrites for sibling services while keeping SwapAI independently buildable and deployable. [Next.js `basePath`](https://nextjs.org/docs/app/api-reference/config/next-config-js/basePath), [Fumadocs static search](https://www.fumadocs.dev/docs/deploying/static)
+Run it as a small Next service and proxy `/swapai` and `/swapai/*` through the
+existing website service. This matches the current `/curing-cancer` child-service
+layout and supports server-side Fumadocs search. [Next.js `basePath`](https://nextjs.org/docs/app/api-reference/config/next-config-js/basePath), [Fumadocs search](https://www.fumadocs.dev/docs/headless/search/orama)
 
-The alternative is adding Fumadocs directly to the existing Next application. That removes one build, but puts SwapAI's docs in the wrong repository and makes package documentation releases depend on the personal site's release. The separate static build is the cleaner boundary.
+The docs deploy separately from the main website application, even though their
+source lives in the same repository. This keeps the Fumadocs dependencies and
+layout isolated from the personal-site application.
 
 ## Comparison
 
