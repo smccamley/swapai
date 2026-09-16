@@ -113,6 +113,49 @@ import { classifyWithReference } from "@swapai/core/effect";
 const program = classifyWithReference(relevance, input, callReferenceEffect);
 ```
 
+## Classifier monitor
+
+Start the built-in local monitor against the same data directory as your
+classifiers:
+
+```sh
+npx @swapai/core classifiers-ui --data-directory .swapai
+```
+
+Then open `http://127.0.0.1:4789`. The page shows every stored classifier, its
+retained and lifetime example counts, last measured held-out error, target
+error, and whether it is loaded, training, or trained. The page refreshes every
+three seconds. SwapAI never returns classification inputs or saved model paths
+from the monitor API.
+
+If you want an npm script in your application:
+
+```json
+{
+  "scripts": {
+    "swapai:classifiers": "swapai classifiers-ui"
+  }
+}
+```
+
+```sh
+npm run swapai:classifiers
+```
+
+The server binds to `127.0.0.1` by default. Use `--host`, `--port`, or the
+`SWAPAI_DATA_DIRECTORY` environment variable when needed. Applications can
+also start it programmatically:
+
+```ts
+import { startClassifiersUi } from "@swapai/core/classifiers-ui";
+
+const monitor = await startClassifiersUi({
+  dataDirectory: ".swapai",
+  host: "127.0.0.1",
+  port: 4789,
+});
+```
+
 ## Runtime
 
 Needle runs locally. On first use SwapAI creates its private runtime under

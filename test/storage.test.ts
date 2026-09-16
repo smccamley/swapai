@@ -58,6 +58,8 @@ describe("SQLite storage", () => {
     first.addExample("I owe you £5", 0.92);
     first.addExample("Paid rent", 0.81);
     first.markTrainingAttempted(2);
+    first.recordEvaluation(0.08);
+    first.registerRuntime("runtime-1", 1234);
     first.promoteGeneration({
       modelPath: "/models/accountant-relevance-1.cact",
       needleVersion: "2.4.0",
@@ -81,6 +83,8 @@ describe("SQLite storage", () => {
       newExamplesSinceTraining: 0,
       trainingAttempts: 1,
       examplesUsedForTraining: 2,
+      lastEvaluatedError: 0.08,
+      lastEvaluatedAt: expect.any(Number),
       localClassificationsSinceRetest: 0,
       totalLocalClassifications: 2,
       totalRetests: 2,
@@ -89,12 +93,41 @@ describe("SQLite storage", () => {
       modelPath: "/models/accountant-relevance-1.cact",
       needleVersion: "2.4.0",
     });
+    expect(second.listLiveRuntimes(Date.now() - 60_000)).toEqual([
+      expect.objectContaining({ runtimeId: "runtime-1", pid: 1234 }),
+    ]);
     expect(second.listExamples().map(({ input, result }) => ({ input, result }))).toEqual([
       { input: "I owe you £5", result: 0.92 },
       { input: "Paid rent", result: 0.81 },
     ]);
 
     second.close();
+  });
+
+  it("keeps the last completed error while a new training attempt runs", () => {
+    const storage = openTestStorage(makeDirectory());
+    storage.addExample("first", true);
+    storage.recordEvaluation(0.2);
+
+    storage.markTrainingAttempted(1);
+
+    expect(storage.snapshot()).toMatchObject({
+      lastEvaluatedError: 0.2,
+      lastEvaluatedAt: expect.any(Number),
+    });
+    storage.close();
+  });
+
+  it("removes a classifier runtime when it closes", () => {
+    const storage = openTestStorage(makeDirectory());
+    storage.registerRuntime("runtime-1", 1234);
+    storage.heartbeatRuntime("runtime-1");
+    expect(storage.listLiveRuntimes(Date.now() - 60_000)).toHaveLength(1);
+
+    storage.removeRuntime("runtime-1");
+
+    expect(storage.listLiveRuntimes(Date.now() - 60_000)).toEqual([]);
+    storage.close();
   });
 
   it("always assigns repeated inputs to the same training or held-out set", () => {

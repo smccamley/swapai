@@ -1,6 +1,6 @@
 {
   "name": "@swapai/core",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Replace paid classifiers with locally trained Needle 2 classifiers.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,9 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
   ],
+  "bin": {
+    "swapai": "dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -31,6 +34,10 @@
     "./effect": {
       "types": "./dist/effect.d.ts",
       "import": "./dist/effect.js"
+    },
+    "./classifiers-ui": {
+      "types": "./dist/classifiers-ui.d.ts",
+      "import": "./dist/classifiers-ui.js"
     }
   },
   "scripts": {

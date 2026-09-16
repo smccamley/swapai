@@ -25,6 +25,7 @@ import type {
 
 const TRAINING_LEASE_DURATION_MS = 5 * 60 * 1000;
 const TRAINING_LEASE_RENEWAL_MS = 60 * 1000;
+const RUNTIME_HEARTBEAT_MS = 2_000;
 const ARTIFACT_LOCK_WAIT_MS = 30_000;
 
 export function init<const Config extends ResultConfig>(
@@ -90,6 +91,18 @@ function createClassifier<const Config extends ResultConfig>(
   let trainingQueue: Promise<void> = Promise.resolve();
   let trainingScheduled = false;
   const trainingLeaseOwner = `${process.pid}:${randomUUID()}`;
+  storage.registerRuntime(trainingLeaseOwner, process.pid);
+  const runtimeHeartbeat = setInterval(() => {
+    try {
+      storage.heartbeatRuntime(trainingLeaseOwner);
+    } catch (error) {
+      reportBackgroundError(
+        config,
+        toSwapAIError(error, "storage_failed", "Could not update classifier status"),
+      );
+    }
+  }, RUNTIME_HEARTBEAT_MS);
+  runtimeHeartbeat.unref();
   let classificationQueue: Promise<void> = Promise.resolve();
   let queuedFailure: SwapAIError | null = null;
   let clearFailure: SwapAIError | null = null;
@@ -372,7 +385,15 @@ function createClassifier<const Config extends ResultConfig>(
           });
         }
 
-        if (averageError(config.result, comparisons) > config.acceptableError) {
+        const measuredError = averageError(config.result, comparisons);
+        if (!storage.recordEvaluation(measuredError, trainingEpoch)) {
+          await runtime.clearClassifierGenerationArtifacts(
+            config.name,
+            snapshot.activeGeneration,
+          );
+          return false;
+        }
+        if (measuredError > config.acceptableError) {
           return true;
         }
 
@@ -838,6 +859,8 @@ function createClassifier<const Config extends ResultConfig>(
           failures.push(error);
         }
         try {
+          clearInterval(runtimeHeartbeat);
+          storage.removeRuntime(trainingLeaseOwner);
           storage.close();
         } catch (error) {
           failures.push(error);

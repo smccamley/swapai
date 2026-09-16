@@ -45,6 +45,8 @@ export interface StorageSnapshot {
   newExamplesSinceTraining: number;
   trainingAttempts: number;
   examplesUsedForTraining: number;
+  lastEvaluatedError: number | null;
+  lastEvaluatedAt: number | null;
   localClassificationsSinceRetest: number;
   totalLocalClassifications: number;
   totalRetests: number;
@@ -59,6 +61,13 @@ export interface StorageSnapshot {
   trainingLeaseOwner: string | null;
   trainingLeaseEpoch: number | null;
   trainingLeaseUntil: number | null;
+}
+
+export interface StoredRuntime {
+  runtimeId: string;
+  pid: number;
+  startedAt: number;
+  heartbeatAt: number;
 }
 
 export interface PromotedModel {
@@ -85,6 +94,7 @@ export interface Storage {
     expectedDataEpoch: number,
   ): StoredExample[] | null;
   markTrainingAttempted(exampleCount: number, expectedDataEpoch?: number): boolean;
+  recordEvaluation(error: number, expectedDataEpoch?: number): boolean;
   promoteGeneration(
     model: PromotedModel,
     expectedDataEpoch?: number,
@@ -97,6 +107,10 @@ export interface Storage {
     expectedDataEpoch?: number,
   ): boolean;
   releaseTrainingLease(owner: string): void;
+  registerRuntime(runtimeId: string, pid: number): void;
+  heartbeatRuntime(runtimeId: string): void;
+  removeRuntime(runtimeId: string): void;
+  listLiveRuntimes(heartbeatAfter: number): StoredRuntime[];
   archiveAndReset(
     expectedDataEpoch?: number,
     options?: ArchiveAndResetOptions,
@@ -119,6 +133,8 @@ interface ClassifierRow {
   new_examples_since_training: number;
   training_attempts: number;
   examples_used_for_training: number;
+  last_evaluated_error: number | null;
+  last_evaluated_at: number | null;
   local_classifications_since_retest: number;
   total_local_classifications: number;
   total_retests: number;
@@ -165,6 +181,8 @@ const SCHEMA = `
     new_examples_since_training INTEGER NOT NULL DEFAULT 0,
     training_attempts INTEGER NOT NULL DEFAULT 0,
     examples_used_for_training INTEGER NOT NULL DEFAULT 0,
+    last_evaluated_error REAL,
+    last_evaluated_at INTEGER,
     local_classifications_since_retest INTEGER NOT NULL DEFAULT 0,
     total_local_classifications INTEGER NOT NULL DEFAULT 0,
     total_retests INTEGER NOT NULL DEFAULT 0,
@@ -209,6 +227,19 @@ const SCHEMA = `
     ON examples(classifier_name, generation, id);
   CREATE INDEX IF NOT EXISTS examples_by_split
     ON examples(classifier_name, generation, split, id);
+
+  CREATE TABLE IF NOT EXISTS classifier_runtimes (
+    classifier_name TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL,
+    PRIMARY KEY (classifier_name, runtime_id),
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS classifier_runtimes_by_heartbeat
+    ON classifier_runtimes(classifier_name, heartbeat_at);
 
   CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_insert
     BEFORE INSERT ON classifiers
@@ -373,6 +404,8 @@ export function openStorage(options: OpenStorageOptions): Storage {
           c.new_examples_since_training,
           c.training_attempts,
           c.examples_used_for_training,
+          c.last_evaluated_error,
+          c.last_evaluated_at,
           c.local_classifications_since_retest,
           c.total_local_classifications,
           c.total_retests,
@@ -409,6 +442,8 @@ export function openStorage(options: OpenStorageOptions): Storage {
         newExamplesSinceTraining: row.new_examples_since_training,
         trainingAttempts: row.training_attempts,
         examplesUsedForTraining: row.examples_used_for_training,
+        lastEvaluatedError: row.last_evaluated_error,
+        lastEvaluatedAt: row.last_evaluated_at,
         localClassificationsSinceRetest: row.local_classifications_since_retest,
         totalLocalClassifications: row.total_local_classifications,
         totalRetests: row.total_retests,
@@ -525,6 +560,22 @@ export function openStorage(options: OpenStorageOptions): Storage {
       return result.changes === 1;
     },
 
+    recordEvaluation(error, expectedDataEpoch) {
+      assertOpen(closed);
+      if (!Number.isFinite(error) || error < 0 || error > 1) {
+        throw new TypeError("evaluation error must be between 0 and 1");
+      }
+      const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
+      const result = database.prepare(`
+        UPDATE classifiers
+        SET last_evaluated_error = ?,
+            last_evaluated_at = ?,
+            updated_at = ?
+        WHERE name = ? AND data_epoch = ? AND clear_pending = 0
+      `).run(error, Date.now(), Date.now(), options.name, epoch);
+      return result.changes === 1;
+    },
+
     promoteGeneration(model, expectedDataEpoch) {
       assertOpen(closed);
       let generation = 0;
@@ -615,6 +666,56 @@ export function openStorage(options: OpenStorageOptions): Storage {
       `).run(Date.now(), options.name, owner);
     },
 
+    registerRuntime(runtimeId, pid) {
+      assertOpen(closed);
+      if (runtimeId.trim() === "" || !Number.isSafeInteger(pid) || pid <= 0) {
+        throw new TypeError("runtime needs an id and positive process id");
+      }
+      const now = Date.now();
+      database.prepare(`
+        INSERT INTO classifier_runtimes (
+          classifier_name, runtime_id, pid, started_at, heartbeat_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(classifier_name, runtime_id) DO UPDATE SET
+          pid = excluded.pid,
+          heartbeat_at = excluded.heartbeat_at
+      `).run(options.name, runtimeId, pid, now, now);
+    },
+
+    heartbeatRuntime(runtimeId) {
+      assertOpen(closed);
+      database.prepare(`
+        UPDATE classifier_runtimes
+        SET heartbeat_at = ?
+        WHERE classifier_name = ? AND runtime_id = ?
+      `).run(Date.now(), options.name, runtimeId);
+    },
+
+    removeRuntime(runtimeId) {
+      assertOpen(closed);
+      database.prepare(`
+        DELETE FROM classifier_runtimes
+        WHERE classifier_name = ? AND runtime_id = ?
+      `).run(options.name, runtimeId);
+    },
+
+    listLiveRuntimes(heartbeatAfter) {
+      assertOpen(closed);
+      if (!Number.isFinite(heartbeatAfter)) {
+        throw new TypeError("heartbeat cutoff must be finite");
+      }
+      return database.prepare(`
+        SELECT
+          runtime_id AS runtimeId,
+          pid,
+          started_at AS startedAt,
+          heartbeat_at AS heartbeatAt
+        FROM classifier_runtimes
+        WHERE classifier_name = ? AND heartbeat_at >= ?
+        ORDER BY started_at, runtime_id
+      `).all(options.name, heartbeatAfter).map((value) => row<StoredRuntime>(value));
+    },
+
     archiveAndReset(expectedDataEpoch, resetOptions) {
       assertOpen(closed);
       let nextGeneration = 0;
@@ -661,6 +762,8 @@ export function openStorage(options: OpenStorageOptions): Storage {
               new_examples_since_training = ?,
               training_attempts = 0,
               examples_used_for_training = 0,
+              last_evaluated_error = NULL,
+              last_evaluated_at = NULL,
               training_lease_owner = NULL,
               training_lease_until = NULL,
               training_lease_epoch = NULL,
@@ -735,6 +838,8 @@ export function openStorage(options: OpenStorageOptions): Storage {
               new_examples_since_training = 0,
               training_attempts = 0,
               examples_used_for_training = 0,
+              last_evaluated_error = NULL,
+              last_evaluated_at = NULL,
               local_classifications_since_retest = 0,
               total_local_classifications = 0,
               total_retests = 0,
@@ -937,6 +1042,16 @@ function migrateClassifierColumns(database: DatabaseSyncType): void {
     if (!columns.has("training_lease_epoch")) {
       database.exec(
         "ALTER TABLE classifiers ADD COLUMN training_lease_epoch INTEGER",
+      );
+    }
+    if (!columns.has("last_evaluated_error")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN last_evaluated_error REAL",
+      );
+    }
+    if (!columns.has("last_evaluated_at")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN last_evaluated_at INTEGER",
       );
     }
   });

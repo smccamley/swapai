@@ -16,6 +16,7 @@ import {
 import { init } from "../src/index.js";
 import { SwapAIError } from "../src/errors.js";
 import { assignExampleSplit, openStorage } from "../src/storage.js";
+import { readClassifierStatuses } from "../src/status.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
@@ -296,8 +297,9 @@ describe("classifier", () => {
 
   it("trains, tests the exported model on held-out examples, then promotes it", async () => {
     const name = "promoted";
+    const dataDirectory = makeDirectory();
     const [trainingInput, heldOutInput] = inputsForBothSplits(name);
-    const classifier = init(booleanConfig(makeDirectory(), name));
+    const classifier = init(booleanConfig(dataDirectory, name));
 
     classifier.logClassification(trainingInput, true);
     classifier.logClassification(heldOutInput, true);
@@ -312,21 +314,41 @@ describe("classifier", () => {
     );
     expect(needle.model.classify).toHaveBeenCalledWith(heldOutInput);
     expect(classifier.isTrained()).toBe(true);
+    expect(readClassifierStatuses({ dataDirectory })).toEqual([
+      expect.objectContaining({
+        name,
+        lastEvaluatedError: 0,
+        loaded: true,
+        loadedProcessCount: 1,
+        trained: true,
+      }),
+    ]);
     await expect(classifier.classify("new input")).resolves.toBe(true);
     await classifier.close();
+    expect(readClassifierStatuses({ dataDirectory })[0]).toMatchObject({
+      loaded: false,
+      loadedProcessCount: 0,
+      trained: true,
+    });
   });
 
   it("does not promote a model that exceeds the average acceptable error", async () => {
     const name = "rejected";
+    const dataDirectory = makeDirectory();
     const [trainingInput, heldOutInput] = inputsForBothSplits(name);
     needle.model.classify.mockResolvedValue(false);
-    const classifier = init(booleanConfig(makeDirectory(), name));
+    const classifier = init(booleanConfig(dataDirectory, name));
 
     classifier.logClassification(trainingInput, true);
     classifier.logClassification(heldOutInput, true);
     await classifier.flush();
 
     expect(classifier.isTrained()).toBe(false);
+    expect(readClassifierStatuses({ dataDirectory })[0]).toMatchObject({
+      lastEvaluatedError: 1,
+      acceptableError: 0,
+      trained: false,
+    });
     expect(needle.model.close).toHaveBeenCalled();
     await expect(classifier.classify("manual only")).rejects.toMatchObject({
       code: "not_trained",

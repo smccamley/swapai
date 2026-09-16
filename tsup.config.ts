@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/effect.ts"],
+  entry: ["src/index.ts", "src/effect.ts", "src/classifiers-ui.ts", "src/cli.ts"],
   format: ["esm"],
   platform: "node",
   target: "node22",
