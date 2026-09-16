@@ -95,6 +95,14 @@ init({
 
 The string result is inferred as `"rabbit" | "fish" | "pig"`.
 
+Needle is a classifier, not a regression engine. For bounded numbers, SwapAI
+converts reference scores into a small, closed set of internal labels, then
+converts the selected label back to a number. When the training set contains
+only a few scores, those scores stay exact. Larger score sets are quantized to
+a bounded set based on `acceptableError`. The held-out test still compares the
+decoded number with the original reference score, so quantization consumes the
+same error budget and cannot bypass the accuracy gate.
+
 ## Effect
 
 Effect is optional and lives in a separate import:

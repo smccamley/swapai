@@ -1,30 +1,59 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MAX_NEEDLE_NUMBER_LABELS,
   createNeedleTool,
+  createNeedleNumberLabels,
   createTrainingLine,
   readClassificationResult,
 } from "../src/needle.js";
 
 describe("Needle classifier format", () => {
-  it("builds a bounded numeric classify tool", () => {
-    expect(createNeedleTool({ type: "number", min: 0, max: 1 })).toEqual({
+  it("encodes numeric results as closed Needle classification buckets", () => {
+    const config = { type: "number", min: 0, max: 1 } as const;
+    const labels = createNeedleNumberLabels([0.92, 0.08, 0.92], config);
+    const tool = createNeedleTool(config, labels);
+    expect(tool).toMatchObject({
       name: "classify",
-      description: "Classify every supplied input and always return the learned result.",
       parameters: {
-        type: "object",
         properties: {
           result: {
-            type: "number",
-            minimum: 0,
-            maximum: 1,
-            description: "The classification result.",
+            type: "string",
+            description: "The numeric classification bucket from 0 to 1.",
           },
         },
-        required: ["result"],
-        additionalProperties: false,
       },
     });
+    const values = tool.parameters.properties.result.enum as string[];
+    expect(labels.values).toEqual([0.08, 0.92]);
+    expect(values).toEqual(["lower_score", "higher_score"]);
+  });
+
+  it("bounds high-cardinality numeric results and maps each result to its nearest label", () => {
+    const config = { type: "number", min: 0, max: 1 } as const;
+    const values = Array.from({ length: 10_000 }, (_, index) => index / 9_999);
+    const labels = createNeedleNumberLabels(values, config, 0.01);
+
+    expect(labels.values).toHaveLength(51);
+    expect(Math.abs(labels.values[0]! - config.min)).toBeLessThanOrEqual(0.01);
+    expect(Math.abs(config.max - labels.values.at(-1)!)).toBeLessThanOrEqual(0.01);
+    expect(new Set(labels.values).size).toBe(51);
+
+    const rows = values.map((value, index) =>
+      createTrainingLine(`score ${index}`, value, config, labels),
+    );
+    expect(Buffer.byteLength(rows.join("\n"))).toBeLessThan(20_000_000);
+    expect(JSON.parse(rows[5_000]!).answers[0].arguments.result).toMatch(
+      /^score_bucket_\d+$/,
+    );
+  });
+
+  it("caps zero-error numeric labels at the private Needle limit", () => {
+    const config = { type: "number", min: 0, max: 1 } as const;
+    const values = Array.from({ length: 10_000 }, (_, index) => index / 9_999);
+    expect(createNeedleNumberLabels(values, config, 0).values).toHaveLength(
+      MAX_NEEDLE_NUMBER_LABELS,
+    );
   });
 
   it("builds boolean and closed string classify tools", () => {
@@ -54,6 +83,49 @@ describe("Needle classifier format", () => {
     });
     expect(line).not.toContain("confidence");
     expect(line).not.toContain("reasoning");
+  });
+
+  it("writes numeric training labels as closed buckets and decodes them back to numbers", () => {
+    const config = { type: "number", min: 0, max: 1 } as const;
+    const labels = createNeedleNumberLabels([0.92, 0.81], config);
+    const line = createTrainingLine("Accountant relevance", 0.92, config, labels);
+
+    expect(JSON.parse(line).answers).toEqual([
+      { name: "classify", arguments: { result: "higher_score" } },
+    ]);
+    expect(
+      readClassificationResult(
+        {
+          function_calls: [
+            { name: "classify", arguments: { result: "lower_score" } },
+          ],
+        },
+        config,
+        labels,
+      ),
+    ).toBe(0.81);
+    expect(() =>
+      readClassificationResult(
+        {
+          function_calls: [
+            { name: "classify", arguments: { result: "score_bucket_999" } },
+          ],
+        },
+        config,
+        labels,
+      ),
+    ).toThrow(/number outside 0 to 1/i);
+    expect(() =>
+      readClassificationResult(
+        {
+          function_calls: [
+            { name: "classify", arguments: { result: "score_bucket_00" } },
+          ],
+        },
+        config,
+        labels,
+      ),
+    ).toThrow(/number outside 0 to 1/i);
   });
 
   it("accepts exactly one classify call and validates its result", () => {

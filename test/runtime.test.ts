@@ -9,7 +9,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   NEEDLE_VERSION,
+  NeedleModelArtifactError,
   createNeedleRuntime,
+  hasNeedleModelArtifacts,
   type NeedleSpawn,
   type RunCommand,
 } from "../src/runtime.js";
@@ -36,8 +38,18 @@ async function makeFakeCommands(dataDirectory: string) {
     const outputIndex = args.indexOf("--output");
     if (outputIndex >= 0) {
       const trainingIndex = args.indexOf("--training-data");
-      await writeFile(args[trainingIndex + 1]!, options?.stdin ?? "");
+      let trainingInput = options?.stdin ?? "";
+      let numberLabels: string | undefined;
+      if (args.includes("--numeric-labels-from-stdin")) {
+        const newline = trainingInput.indexOf("\n");
+        numberLabels = trainingInput.slice(0, newline);
+        trainingInput = trainingInput.slice(newline + 1);
+      }
+      await writeFile(args[trainingIndex + 1]!, trainingInput);
       await writeFile(args[outputIndex + 1]!, "fake cact");
+      if (numberLabels !== undefined) {
+        await writeFile(`${args[outputIndex + 1]!}.numbers.json`, numberLabels);
+      }
     }
 
     return { stdout: "", stderr: "" };
@@ -52,7 +64,10 @@ class FakeNeedleProcess extends EventEmitter {
   readonly stdin: Writable;
   readonly requests: unknown[] = [];
 
-  constructor(private readonly stops = true) {
+  constructor(
+    private readonly stops = true,
+    private readonly result: unknown = true,
+  ) {
     super();
     let buffered = "";
     this.stdin = new Writable({
@@ -70,7 +85,7 @@ class FakeNeedleProcess extends EventEmitter {
           this.requests.push(request);
           if (request.type === "classify") {
             this.stdout.write(
-              `${JSON.stringify({ id: request.id, ok: true, result: true })}\n`,
+              `${JSON.stringify({ id: request.id, ok: true, result: this.result })}\n`,
             );
           } else if (request.type === "close") {
             this.stdout.write(`${JSON.stringify({ type: "closed" })}\n`);
@@ -298,6 +313,98 @@ describe("managed Needle runtime", () => {
     await runtime.close();
   });
 
+  it("does not write numeric labels after the training epoch was cleared", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-number-clear-race-"));
+    const name = "numeric-clear-race";
+    const storage = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: 10,
+      config: {
+        result: { type: "number", min: 0, max: 1 },
+        retrainOnCount: 2,
+        acceptableError: 0.1,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+    });
+    const fake = await makeFakeCommands(dataDirectory);
+    let signalReadyCheck!: () => void;
+    const readyCheckStarted = new Promise<void>((resolve) => {
+      signalReadyCheck = resolve;
+    });
+    let resumeReady!: () => void;
+    const readyCanFinish = new Promise<void>((resolve) => {
+      resumeReady = resolve;
+    });
+    let paused = false;
+    let modelPath = "";
+    const runCommand: RunCommand = async (command, args, options) => {
+      if (!paused && command === "uv" && args[0] === "--version") {
+        paused = true;
+        signalReadyCheck();
+        await readyCanFinish;
+      }
+      if (args.includes("train")) {
+        modelPath = args[args.indexOf("--output") + 1]!;
+        expect(args).toContain("--numeric-labels-from-stdin");
+        expect(JSON.parse((options?.stdin ?? "").split("\n")[0]!)).toEqual({
+          format: 1,
+          values: [0.08, 0.92],
+        });
+        const database = new DatabaseSync(
+          args[args.indexOf("--main-database") + 1]!,
+          { readOnly: true },
+        );
+        const row = database.prepare(`
+          SELECT data_epoch, clear_pending FROM classifiers WHERE name = ?
+        `).get(name) as { data_epoch: number; clear_pending: number };
+        database.close();
+        const expectedEpoch = Number(
+          args[args.indexOf("--expected-epoch") + 1],
+        );
+        if (row.data_epoch !== expectedEpoch || row.clear_pending !== 0) {
+          throw new Error("Classifier training was superseded by data erasure");
+        }
+      }
+      return fake.runCommand(command, args, options);
+    };
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand },
+    });
+    const training = runtime.train({
+      classifierName: name,
+      generation: 1,
+      expectedEpoch: 0,
+      acceptableError: 0.1,
+      resultConfig: { type: "number", min: 0, max: 1 },
+      examples: [
+        { input: "weather", result: 0.08 },
+        { input: "invoice", result: 0.92 },
+      ],
+    });
+
+    await readyCheckStarted;
+    storage.clearTrainingData();
+    resumeReady();
+    await expect(training).rejects.toMatchObject({
+      message: "Needle training failed.",
+      cause: expect.objectContaining({
+        message: expect.stringMatching(/superseded by data erasure/i),
+      }),
+    });
+    await expect(readFile(modelPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(`${modelPath}.numbers.json`, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await runtime.close();
+    storage.close();
+  });
+
   it("deletes one classifier's artifacts without deleting other classifiers or the managed runtime", async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-clear-"));
     const fake = await makeFakeCommands(dataDirectory);
@@ -422,6 +529,92 @@ describe("managed Needle runtime", () => {
 
     await model.close();
     expect(worker.requests).toContainEqual({ type: "close" });
+    await runtime.close();
+  });
+
+  it("persists numeric labels with the model and decodes the selected label", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-number-labels-"));
+    const name = "numeric-labels";
+    const fake = await makeFakeCommands(dataDirectory);
+    const worker = new FakeNeedleProcess(true, "higher_score");
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: {
+        runCommand: fake.runCommand,
+        spawnProcess: vi.fn(() => worker),
+      },
+    });
+    const storage = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: 10,
+      config: {
+        result: { type: "number", min: 0, max: 1 },
+        retrainOnCount: 2,
+        acceptableError: 0.1,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+    });
+
+    const trained = await runtime.train({
+      classifierName: name,
+      generation: 1,
+      expectedEpoch: 0,
+      resultConfig: { type: "number", min: 0, max: 1 },
+      examples: [
+        { input: "newsletter", result: 0.08 },
+        { input: "invoice", result: 0.92 },
+      ],
+    });
+    expect(
+      JSON.parse(await readFile(`${trained.modelPath}.numbers.json`, "utf8")),
+    ).toEqual({ format: 1, values: [0.08, 0.92] });
+    const trainCall = fake.calls.find((call) => call.args.includes("train"))!;
+    const trainingPath = trainCall.args[trainCall.args.indexOf("--training-data") + 1]!;
+    const rows = (await readFile(trainingPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(rows.map((row) => row.answers[0].arguments.result)).toEqual([
+      "lower_score",
+      "higher_score",
+    ]);
+    expect(rows[0].tools[0].parameters.properties.result.enum).toEqual([
+      "lower_score",
+      "higher_score",
+    ]);
+
+    const model = await runtime.loadModel({
+      modelPath: trained.modelPath,
+      resultConfig: { type: "number", min: 0, max: 1 },
+    });
+    await expect(model.classify("invoice")).resolves.toBe(0.92);
+    await model.close();
+    await runtime.close();
+    storage.close();
+  });
+
+  it("rejects an empty numeric label sidecar as a broken model artifact", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-empty-labels-"));
+    const fake = await makeFakeCommands(dataDirectory);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand },
+    });
+    const modelPath = join(dataDirectory, "model.cact");
+    const resultConfig = { type: "number", min: 0, max: 1 } as const;
+    await writeFile(modelPath, "fake cact");
+    await writeFile(
+      `${modelPath}.numbers.json`,
+      JSON.stringify({ format: 1, values: [] }),
+    );
+
+    expect(hasNeedleModelArtifacts({ modelPath, resultConfig })).toBe(false);
+    await expect(runtime.loadModel({ modelPath, resultConfig })).rejects.toBeInstanceOf(
+      NeedleModelArtifactError,
+    );
     await runtime.close();
   });
 

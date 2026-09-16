@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -16,15 +17,20 @@ import { fileURLToPath } from "node:url";
 
 import { SwapAIError } from "./errors.js";
 import {
+  createNeedleNumberLabels,
   createNeedleTool,
   createTrainingLine,
+  decodeNeedleResult,
   validateNeedleResult,
   type NeedleExample,
+  type NeedleNumberLabels,
   type NeedleResultConfig,
   type NeedleResultValue,
 } from "./needle.js";
 
 export const NEEDLE_VERSION = "2.0.14";
+export const NEEDLE_NUMBER_MODEL_VERSION =
+  `${NEEDLE_VERSION}/number-buckets-v1`;
 const UV_VERSION = "0.11.4";
 const PYTHON_VERSION = "3.12";
 
@@ -76,12 +82,21 @@ export interface TrainNeedleModelOptions {
   readonly expectedEpoch: number;
   readonly examples: readonly NeedleExample[];
   readonly resultConfig: NeedleResultConfig;
+  readonly acceptableError?: number;
   readonly epochs?: number;
 }
 
 export interface TrainedNeedleModel {
   readonly modelPath: string;
-  readonly needleVersion: typeof NEEDLE_VERSION;
+  readonly needleVersion: string;
+}
+
+export function needleModelVersion(
+  resultConfig: NeedleResultConfig,
+): string {
+  return resultConfig.type === "number"
+    ? NEEDLE_NUMBER_MODEL_VERSION
+    : NEEDLE_VERSION;
 }
 
 export interface LoadNeedleModelOptions {
@@ -92,6 +107,41 @@ export interface LoadNeedleModelOptions {
 export interface LoadedNeedleModel {
   classify(input: string): Promise<NeedleResultValue>;
   close(): Promise<void>;
+}
+
+export class NeedleModelArtifactError extends SwapAIError {
+  constructor(message: string, cause?: unknown) {
+    super(
+      "service_unavailable",
+      message,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "NeedleModelArtifactError";
+  }
+}
+
+export function hasNeedleModelArtifacts(
+  options: LoadNeedleModelOptions,
+): boolean {
+  try {
+    if (!statSync(options.modelPath).isFile()) return false;
+    if (options.resultConfig.type !== "number") return true;
+    const saved = JSON.parse(
+      readFileSync(`${options.modelPath}.numbers.json`, "utf8"),
+    ) as { format?: unknown; values?: unknown };
+    if (
+      saved.format !== 1 ||
+      !Array.isArray(saved.values) ||
+      saved.values.length === 0
+    ) return false;
+    const savedValues = saved.values as number[];
+    const labels = createNeedleNumberLabels(savedValues, options.resultConfig);
+    return labels.values.length === savedValues.length && labels.values.every(
+      (value, index) => value === savedValues[index],
+    );
+  } catch {
+    return false;
+  }
 }
 
 export interface NeedleRuntime {
@@ -213,8 +263,21 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     await mkdir(checkpointDirectory, { recursive: true, mode: 0o700 });
     await mkdir(candidateDirectory, { recursive: true, mode: 0o700 });
 
+    const numberLabels =
+      options.resultConfig.type === "number"
+        ? createNeedleNumberLabels(
+            options.examples.map((example) => example.result as number),
+            options.resultConfig,
+            options.acceptableError,
+          )
+        : undefined;
     const lines = options.examples.map((example) =>
-      createTrainingLine(example.input, example.result, options.resultConfig),
+      createTrainingLine(
+        example.input,
+        example.result,
+        options.resultConfig,
+        numberLabels,
+      ),
     );
     const lockPath = join(
       this.#dataDirectory,
@@ -223,33 +286,39 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     );
 
     try {
+      const trainArguments = [
+        this.#workerPath,
+        "train",
+        "--training-data",
+        trainingPath,
+        "--output",
+        modelPath,
+        "--checkpoint-dir",
+        checkpointDirectory,
+        "--epochs",
+        String(options.epochs ?? 10),
+        "--artifact-lock-database",
+        lockPath,
+        "--main-database",
+        join(this.#dataDirectory, "swapai.sqlite"),
+        "--classifier-name",
+        options.classifierName,
+        "--expected-epoch",
+        String(options.expectedEpoch),
+      ];
+      if (numberLabels) {
+        trainArguments.push("--numeric-labels-from-stdin");
+      }
       await this.#runCommand(
         this.#pythonPath!,
-        [
-          this.#workerPath,
-          "train",
-          "--training-data",
-          trainingPath,
-          "--output",
-          modelPath,
-          "--checkpoint-dir",
-          checkpointDirectory,
-          "--epochs",
-          String(options.epochs ?? 10),
-          "--artifact-lock-database",
-          lockPath,
-          "--main-database",
-          join(this.#dataDirectory, "swapai.sqlite"),
-          "--classifier-name",
-          options.classifierName,
-          "--expected-epoch",
-          String(options.expectedEpoch),
-        ],
+        trainArguments,
         {
           cwd: candidateDirectory,
           env: this.#environment!,
           timeoutMs: 6 * 60 * 60 * 1000,
-          stdin: `${lines.join("\n")}\n`,
+          stdin: numberLabels
+            ? `${JSON.stringify({ format: 1, values: numberLabels.values })}\n${lines.join("\n")}\n`
+            : `${lines.join("\n")}\n`,
         },
       );
       await stat(modelPath);
@@ -257,7 +326,10 @@ class ManagedNeedleRuntime implements NeedleRuntime {
       throw toRuntimeError("Needle training failed.", error);
     }
 
-    return { modelPath, needleVersion: NEEDLE_VERSION };
+    return {
+      modelPath,
+      needleVersion: needleModelVersion(options.resultConfig),
+    };
   }
 
   async loadModel(options: LoadNeedleModelOptions): Promise<LoadedNeedleModel> {
@@ -265,13 +337,50 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     try {
       await stat(options.modelPath);
     } catch (error) {
-      throw toRuntimeError(`Needle model does not exist: ${options.modelPath}`, error);
+      throw new NeedleModelArtifactError(
+        `Needle model does not exist: ${options.modelPath}`,
+        error,
+      );
+    }
+
+    let numberLabels: NeedleNumberLabels | undefined;
+    if (options.resultConfig.type === "number") {
+      try {
+        const saved = JSON.parse(
+          await readFile(`${options.modelPath}.numbers.json`, "utf8"),
+        ) as { format?: unknown; values?: unknown };
+        if (
+          saved.format !== 1 ||
+          !Array.isArray(saved.values) ||
+          saved.values.length === 0
+        ) {
+          throw new TypeError("Numeric label map has an invalid format.");
+        }
+        const savedValues = saved.values as unknown[];
+        numberLabels = createNeedleNumberLabels(
+          savedValues as number[],
+          options.resultConfig,
+        );
+        if (
+          numberLabels.values.length !== savedValues.length ||
+          numberLabels.values.some(
+            (value, index) => value !== savedValues[index],
+          )
+        ) {
+          throw new TypeError("Numeric label map is not sorted and unique.");
+        }
+      } catch (error) {
+        throw new NeedleModelArtifactError(
+          "Could not load Needle numeric labels.",
+          error,
+        );
+      }
     }
 
     const schemaPath = `${options.modelPath}.schema.json`;
     await writeFile(
       schemaPath,
-      JSON.stringify([createNeedleTool(options.resultConfig)]),
+      JSON.stringify([createNeedleTool(options.resultConfig, numberLabels)]),
       "utf8",
     );
 
@@ -291,6 +400,7 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     const model = new NeedleModelProcess(
       process,
       options.resultConfig,
+      numberLabels,
       (error) => this.#onBackgroundError?.(error),
       () => this.#models.delete(model),
     );
@@ -570,6 +680,7 @@ class ManagedNeedleRuntime implements NeedleRuntime {
 class NeedleModelProcess implements LoadedNeedleModel {
   readonly #process: NeedleChildProcess;
   readonly #resultConfig: NeedleResultConfig;
+  readonly #numberLabels: NeedleNumberLabels | undefined;
   readonly #onBackgroundError: (error: NeedleRuntimeError) => void;
   readonly #onClose: () => void;
   readonly #pending = new Map<
@@ -593,11 +704,13 @@ class NeedleModelProcess implements LoadedNeedleModel {
   constructor(
     process: NeedleChildProcess,
     resultConfig: NeedleResultConfig,
+    numberLabels: NeedleNumberLabels | undefined,
     onBackgroundError: (error: NeedleRuntimeError) => void,
     onClose: () => void,
   ) {
     this.#process = process;
     this.#resultConfig = resultConfig;
+    this.#numberLabels = numberLabels;
     this.#onBackgroundError = onBackgroundError;
     this.#onClose = onClose;
     this.#readyPromise = new Promise((resolve, reject) => {
@@ -755,7 +868,13 @@ class NeedleModelProcess implements LoadedNeedleModel {
       return;
     }
     try {
-      pending.resolve(validateNeedleResult(message.result, this.#resultConfig));
+      pending.resolve(
+        decodeNeedleResult(
+          message.result,
+          this.#resultConfig,
+          this.#numberLabels,
+        ),
+      );
     } catch (error) {
       pending.reject(
         new NeedleRuntimeError(

@@ -23,17 +23,96 @@ export interface NeedleTool {
   };
 }
 
-export function createNeedleTool(config: NeedleResultConfig): NeedleTool {
+export interface NeedleNumberLabels {
+  readonly values: readonly number[];
+}
+
+export const MAX_NEEDLE_NUMBER_LABELS = 64;
+
+export function createNeedleNumberLabels(
+  values: readonly number[],
+  config: Extract<NeedleResultConfig, { type: "number" }>,
+  acceptableError = 0,
+): NeedleNumberLabels {
+  if (
+    typeof acceptableError !== "number" ||
+    !Number.isFinite(acceptableError) ||
+    acceptableError < 0 ||
+    acceptableError > 1
+  ) {
+    throw new TypeError("acceptableError must be between 0 and 1.");
+  }
+  const valid = values.map((value) =>
+    validateNeedleResult(value, config) as number,
+  );
+  const unique = [...new Set(valid)].sort((left, right) => left - right);
+  const desiredLabelCount = acceptableError === 0
+    ? MAX_NEEDLE_NUMBER_LABELS
+    : Math.min(
+        MAX_NEEDLE_NUMBER_LABELS,
+        Math.max(1, Math.floor(1 / (2 * acceptableError)) + 1),
+      );
+  if (unique.length <= desiredLabelCount) return { values: unique };
+
+  const width = (config.max - config.min) / desiredLabelCount;
+  const occupied = new Set<number>();
+  for (const value of unique) {
+    occupied.add(Math.min(
+      desiredLabelCount - 1,
+      Math.floor((value - config.min) / width),
+    ));
+  }
+  return {
+    values: [...occupied]
+      .sort((left, right) => left - right)
+      .map((index) => config.min + (index + 0.5) * width),
+  };
+}
+
+function numberLabel(index: number, count: number): string {
+  if (count === 1) return "only_score";
+  if (count === 2) return index === 0 ? "lower_score" : "higher_score";
+  return `score_bucket_${index}`;
+}
+
+function encodeNumberResult(
+  value: number,
+  labels: NeedleNumberLabels,
+): string {
+  if (labels.values.length === 0) {
+    throw new TypeError("Numeric result has no Needle label.");
+  }
+  let closestIndex = 0;
+  let closestDistance = Math.abs(value - labels.values[0]!);
+  for (let index = 1; index < labels.values.length; index += 1) {
+    const distance = Math.abs(value - labels.values[index]!);
+    if (distance < closestDistance) {
+      closestIndex = index;
+      closestDistance = distance;
+    }
+  }
+  return numberLabel(closestIndex, labels.values.length);
+}
+
+export function createNeedleTool(
+  config: NeedleResultConfig,
+  numberLabels?: NeedleNumberLabels,
+): NeedleTool {
   const description = "The classification result.";
   let result: Record<string, unknown>;
 
   switch (config.type) {
     case "number":
+      if (!numberLabels || numberLabels.values.length === 0) {
+        throw new TypeError("Numeric Needle tools require at least one result label.");
+      }
       result = {
-        type: "number",
-        minimum: config.min,
-        maximum: config.max,
-        description,
+        type: "string",
+        enum: numberLabels.values.map((_, index) =>
+          numberLabel(index, numberLabels.values.length),
+        ),
+        description:
+          `The numeric classification bucket from ${config.min} to ${config.max}.`,
       };
       break;
     case "boolean":
@@ -60,12 +139,17 @@ export function createTrainingLine(
   input: string,
   value: NeedleResultValue,
   config: NeedleResultConfig,
+  numberLabels?: NeedleNumberLabels,
 ): string {
   const result = validateNeedleResult(value, config);
+  const needleResult =
+    config.type === "number"
+      ? encodeNumberResult(result as number, numberLabels ?? { values: [] })
+      : result;
   return JSON.stringify({
     query: input,
-    tools: [createNeedleTool(config)],
-    answers: [{ name: "classify", arguments: { result } }],
+    tools: [createNeedleTool(config, numberLabels)],
+    answers: [{ name: "classify", arguments: { result: needleResult } }],
   });
 }
 
@@ -102,6 +186,7 @@ export function validateNeedleResult(
 export function readClassificationResult(
   response: unknown,
   config: NeedleResultConfig,
+  numberLabels?: NeedleNumberLabels,
 ): NeedleResultValue {
   if (!isRecord(response) || !Array.isArray(response.function_calls)) {
     throw new TypeError("Needle did not return exactly one classify call.");
@@ -119,7 +204,33 @@ export function readClassificationResult(
     throw new TypeError("Needle did not return exactly one classify call.");
   }
 
-  return validateNeedleResult(call.arguments.result, config);
+  return decodeNeedleResult(call.arguments.result, config, numberLabels);
+}
+
+export function decodeNeedleResult(
+  result: unknown,
+  config: NeedleResultConfig,
+  numberLabels?: NeedleNumberLabels,
+): NeedleResultValue {
+  if (config.type === "number") {
+    if (typeof result !== "string") {
+      throw new TypeError(
+        `Needle returned a number outside ${config.min} to ${config.max}.`,
+      );
+    }
+    const index = numberLabels?.values.findIndex(
+      (_, candidateIndex) =>
+        result === numberLabel(candidateIndex, numberLabels.values.length),
+    ) ?? -1;
+    const decoded = numberLabels?.values[index];
+    if (index < 0 || decoded === undefined) {
+      throw new TypeError(
+        `Needle returned a number outside ${config.min} to ${config.max}.`,
+      );
+    }
+    return validateNeedleResult(decoded, config);
+  }
+  return validateNeedleResult(result, config);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

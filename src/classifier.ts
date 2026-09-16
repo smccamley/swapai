@@ -5,8 +5,10 @@ import { normalizeConfig, validateResult } from "./config.js";
 import { averageError, resultError } from "./evaluation.js";
 import { SwapAIError } from "./errors.js";
 import {
-  NEEDLE_VERSION,
   createNeedleRuntime,
+  hasNeedleModelArtifacts,
+  NeedleModelArtifactError,
+  needleModelVersion,
   type LoadedNeedleModel,
   type NeedleRuntime,
 } from "./runtime.js";
@@ -100,9 +102,16 @@ function createClassifier<const Config extends ResultConfig>(
   if (
     !saved.clearPending &&
     saved.trained &&
-    (saved.modelPath === null || saved.needleVersion !== NEEDLE_VERSION)
+    (saved.modelPath === null ||
+      saved.needleVersion !== needleModelVersion(config.result) ||
+      !hasNeedleModelArtifacts({
+        modelPath: saved.modelPath,
+        resultConfig: config.result,
+      }))
   ) {
-    if (storage.archiveAndReset(saved.dataEpoch) !== null) {
+    if (
+      storage.archiveAndReset(saved.dataEpoch, { retainExamples: true }) !== null
+    ) {
       const reset = storage.snapshot();
       dataEpoch = reset.dataEpoch;
       clearedEpoch = reset.dataEpoch;
@@ -126,13 +135,22 @@ function createClassifier<const Config extends ResultConfig>(
     }
     try {
       await runtime.ready();
-      const snapshot = storage.snapshot();
-      if (snapshot.clearPending) {
-        trained = false;
-        dataEpoch = snapshot.dataEpoch;
-        return;
-      }
-      if (snapshot.trained && snapshot.modelPath !== null) {
+    } catch (error) {
+      rememberBackgroundFailure(toSwapAIError(
+        error,
+        "service_unavailable",
+        "Needle could not start",
+      ));
+      return;
+    }
+    const snapshot = storage.snapshot();
+    if (snapshot.clearPending) {
+      trained = false;
+      dataEpoch = snapshot.dataEpoch;
+      return;
+    }
+    if (snapshot.trained && snapshot.modelPath !== null) {
+      try {
         const restoredModel = await runtime.loadModel({
           modelPath: snapshot.modelPath,
           resultConfig: config.result,
@@ -149,15 +167,33 @@ function createClassifier<const Config extends ResultConfig>(
         } else {
           await restoredModel.close();
         }
+      } catch (error) {
+        if (
+          error instanceof NeedleModelArtifactError &&
+          storage.archiveAndReset(snapshot.dataEpoch, {
+            retainExamples: true,
+          }) !== null
+        ) {
+          const reset = refreshStoredState();
+          dataEpoch = reset.dataEpoch;
+          clearedEpoch = reset.dataEpoch;
+          trained = false;
+        }
+        const loadError = toSwapAIError(
+          error,
+          "service_unavailable",
+          error instanceof NeedleModelArtifactError
+            ? `Could not load classifier "${config.name}"; retraining from saved examples`
+            : `Could not load classifier "${config.name}"`,
+        );
+        if (error instanceof NeedleModelArtifactError) {
+          reportBackgroundError(config, loadError);
+        } else {
+          rememberBackgroundFailure(loadError);
+        }
       }
-    } catch (error) {
-      const swapAIError = toSwapAIError(
-        error,
-        "service_unavailable",
-        "Needle could not start",
-      );
-      rememberBackgroundFailure(swapAIError);
     }
+    scheduleTraining();
   }
 
   function rememberBackgroundFailure(error: SwapAIError): void {
@@ -305,6 +341,7 @@ function createClassifier<const Config extends ResultConfig>(
         expectedEpoch: trainingEpoch,
         examples: trainingExamples.map(({ input, result }) => ({ input, result })),
         resultConfig: config.result,
+        acceptableError: config.acceptableError,
       });
       const candidateModel = await runtime.loadModel({
         modelPath: candidate.modelPath,
@@ -407,10 +444,25 @@ function createClassifier<const Config extends ResultConfig>(
         );
       }
       await runtime.ready();
-      const restored = await runtime.loadModel({
-        modelPath: current.modelPath,
-        resultConfig: config.result,
-      });
+      let restored: LoadedNeedleModel;
+      try {
+        restored = await runtime.loadModel({
+          modelPath: current.modelPath,
+          resultConfig: config.result,
+        });
+      } catch (error) {
+        if (
+          error instanceof NeedleModelArtifactError &&
+          storage.archiveAndReset(expectedEpoch, { retainExamples: true }) !== null
+        ) {
+          const reset = refreshStoredState();
+          dataEpoch = reset.dataEpoch;
+          clearedEpoch = reset.dataEpoch;
+          trained = false;
+          scheduleTraining();
+        }
+        throw error;
+      }
       const afterLoad = refreshStoredState();
       if (
         afterLoad.dataEpoch !== expectedEpoch ||

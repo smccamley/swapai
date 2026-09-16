@@ -66,6 +66,10 @@ export interface PromotedModel {
   needleVersion: string;
 }
 
+export interface ArchiveAndResetOptions {
+  readonly retainExamples?: boolean;
+}
+
 export interface Storage {
   readonly databasePath: string;
   snapshot(): StorageSnapshot;
@@ -93,7 +97,10 @@ export interface Storage {
     expectedDataEpoch?: number,
   ): boolean;
   releaseTrainingLease(owner: string): void;
-  archiveAndReset(expectedDataEpoch?: number): StoredGeneration | null;
+  archiveAndReset(
+    expectedDataEpoch?: number,
+    options?: ArchiveAndResetOptions,
+  ): StoredGeneration | null;
   beginClearTrainingData(): number;
   eraseTrainingData(dataEpoch: number): StoredGeneration | null;
   finishClearTrainingData(dataEpoch: number): boolean;
@@ -608,7 +615,7 @@ export function openStorage(options: OpenStorageOptions): Storage {
       `).run(Date.now(), options.name, owner);
     },
 
-    archiveAndReset(expectedDataEpoch) {
+    archiveAndReset(expectedDataEpoch, resetOptions) {
       assertOpen(closed);
       let nextGeneration = 0;
       const changedAt = Date.now();
@@ -638,11 +645,20 @@ export function openStorage(options: OpenStorageOptions): Storage {
           ) VALUES (?, ?, 'active', ?)
         `).run(options.name, nextGeneration, changedAt);
 
+        let retainedExampleCount = 0;
+        if (resetOptions?.retainExamples) {
+          retainedExampleCount = Number(database.prepare(`
+            UPDATE examples
+            SET generation = ?
+            WHERE classifier_name = ? AND generation = ?
+          `).run(nextGeneration, options.name, currentGeneration).changes);
+        }
+
         database.prepare(`
           UPDATE classifiers
           SET active_generation = ?,
               data_epoch = data_epoch + 1,
-              new_examples_since_training = 0,
+              new_examples_since_training = ?,
               training_attempts = 0,
               examples_used_for_training = 0,
               training_lease_owner = NULL,
@@ -652,7 +668,12 @@ export function openStorage(options: OpenStorageOptions): Storage {
               consecutive_retest_failures = 0,
               updated_at = ?
           WHERE name = ?
-        `).run(nextGeneration, changedAt, options.name);
+        `).run(
+          nextGeneration,
+          retainedExampleCount,
+          changedAt,
+          options.name,
+        );
         reset = true;
       });
 

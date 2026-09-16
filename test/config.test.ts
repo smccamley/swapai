@@ -58,6 +58,19 @@ describe("classification results", () => {
     ).toBe("fish");
   });
 
+  it("rejects numeric bounds whose range overflows", () => {
+    expect(() =>
+      normalizeConfig({
+        ...baseConfig,
+        result: {
+          type: "number",
+          min: -Number.MAX_VALUE,
+          max: Number.MAX_VALUE,
+        },
+      }),
+    ).toThrow(/number result range must be finite/i);
+  });
+
   it.each([
     [{ type: "number", min: 0, max: 1 }, Number.POSITIVE_INFINITY],
     [{ type: "number", min: 0, max: 1 }, 1.01],

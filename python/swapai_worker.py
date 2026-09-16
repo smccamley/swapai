@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -64,8 +65,31 @@ def train(args: argparse.Namespace) -> None:
         checkpoint = checkpoint_dir / "needle2.pkl"
         output = Path(args.output).resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
+        training_input = sys.stdin.read()
+        number_labels: dict[str, Any] | None = None
+        if args.numeric_labels_from_stdin:
+            labels_json, separator, training_input = training_input.partition("\n")
+            if not separator:
+                raise RuntimeError("Numeric label map is missing")
+            labels = json.loads(labels_json)
+            values = labels.get("values") if isinstance(labels, dict) else None
+            if (
+                not isinstance(labels, dict)
+                or labels.get("format") != 1
+                or not isinstance(values, list)
+                or not values
+                or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    for value in values
+                )
+                or values != sorted(set(values))
+            ):
+                raise RuntimeError("Numeric label map has an invalid format")
+            number_labels = labels
         training_data = Path(args.training_data).resolve()
-        training_data.write_text(sys.stdin.read(), encoding="utf-8")
+        training_data.write_text(training_input, encoding="utf-8")
         adapter = output.parent / "swapai-lora.pkl"
         with training_data.open("r", encoding="utf-8") as handle:
             example_count = sum(1 for line in handle if line.strip())
@@ -102,6 +126,11 @@ def train(args: argparse.Namespace) -> None:
         )
         if not output.is_file():
             raise RuntimeError("Needle did not create the requested .cact model")
+        if number_labels is not None:
+            Path(f"{output}.numbers.json").write_text(
+                json.dumps(number_labels, separators=(",", ":")),
+                encoding="utf-8",
+            )
 
 
 def classification_result(response: Any) -> Any:
@@ -179,6 +208,7 @@ def parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--main-database", required=True)
     train_parser.add_argument("--classifier-name", required=True)
     train_parser.add_argument("--expected-epoch", type=int, required=True)
+    train_parser.add_argument("--numeric-labels-from-stdin", action="store_true")
 
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--model", required=True)

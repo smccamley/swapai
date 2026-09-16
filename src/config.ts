@@ -52,6 +52,9 @@ function validateResultConfig(result: ResultConfig): void {
     if (result.max <= result.min) {
       invalidConfiguration("number result max must be greater than min");
     }
+    if (!Number.isFinite(result.max - result.min)) {
+      invalidConfiguration("number result range must be finite");
+    }
     return;
   }
 

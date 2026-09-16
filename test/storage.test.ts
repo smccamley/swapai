@@ -189,6 +189,41 @@ describe("SQLite storage", () => {
     storage.close();
   });
 
+  it("archives an incompatible model while retaining its paid examples", () => {
+    const dataDirectory = makeDirectory();
+    const storage = openTestStorage(dataDirectory);
+    storage.addExample("first paid result", 0.08);
+    storage.addExample("second paid result", 0.92);
+    const before = storage.listExamples();
+    storage.markTrainingAttempted(2);
+    storage.promoteGeneration({
+      modelPath: "/models/old-number.cact",
+      needleVersion: "old-number-format",
+    });
+    const epoch = storage.snapshot().dataEpoch;
+
+    expect(
+      storage.archiveAndReset(epoch, { retainExamples: true }),
+    ).toMatchObject({ generation: 2, trained: false });
+    expect(storage.snapshot()).toMatchObject({
+      activeGeneration: 2,
+      activeExampleCount: 2,
+      totalExamplesLogged: 2,
+      newExamplesSinceTraining: 2,
+      trainingAttempts: 0,
+      examplesUsedForTraining: 0,
+      dataEpoch: epoch + 1,
+    });
+    expect(storage.listExamples()).toEqual(
+      before.map((example) => ({ ...example, generation: 2 })),
+    );
+    expect(
+      storage.archiveAndReset(epoch, { retainExamples: true }),
+    ).toBeNull();
+    expect(storage.snapshot().activeGeneration).toBe(2);
+    storage.close();
+  });
+
   it("deletes all retained generations and counters for only one classifier", () => {
     const dataDirectory = makeDirectory();
     const removed = openTestStorage(dataDirectory, { name: "removed" });

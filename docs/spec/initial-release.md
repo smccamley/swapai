@@ -49,6 +49,14 @@ Numeric error is `abs(reference - candidate) / (max - min)`. Boolean and string
 error is `0` for a match and `1` for a mismatch. `acceptableError: "10%"` and
 `acceptableError: 0.1` mean the same thing.
 
+Needle is trained as a classifier. SwapAI maps numeric reference scores to a
+small, closed set of internal labels and stores the label-to-number map with the
+model. Small score sets stay exact. Larger sets are quantized using the declared
+range and `acceptableError`, with a fixed maximum label count. Held-out error is
+still calculated from the original reference score and decoded local score, so
+the model is rejected when classification plus quantization exceeds the error
+limit.
+
 ## Training
 
 - SQLite stores examples, model generations, counters, and consecutive retest

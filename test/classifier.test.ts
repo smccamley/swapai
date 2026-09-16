@@ -19,15 +19,18 @@ import { assignExampleSplit, openStorage } from "../src/storage.js";
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
 const needle = vi.hoisted(() => {
+  class NeedleModelArtifactError extends Error {}
   const model = {
     classify: vi.fn<(input: string) => Promise<number | boolean | string>>(),
     close: vi.fn(async () => undefined),
   };
   const runtime = {
     ready: vi.fn(async () => undefined),
-    train: vi.fn(async () => ({
+    train: vi.fn(async (options: { resultConfig: { type: string } }) => ({
       modelPath: "/tmp/swapai-candidate.cact",
-      needleVersion: "2.0.14",
+      needleVersion: options.resultConfig.type === "number"
+        ? "2.0.14/number-buckets-v1"
+        : "2.0.14",
     })),
     loadModel: vi.fn(async () => model),
     clearClassifierArtifacts: vi.fn(async () => undefined),
@@ -35,11 +38,17 @@ const needle = vi.hoisted(() => {
     clearClassifierArtifactsThroughGeneration: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
   };
-  return { model, runtime };
+  return { NeedleModelArtifactError, model, runtime };
 });
 
 vi.mock("../src/runtime.js", () => ({
   NEEDLE_VERSION: "2.0.14",
+  needleModelVersion: (result: { type: string }) =>
+    result.type === "number"
+      ? "2.0.14/number-buckets-v1"
+      : "2.0.14",
+  NeedleModelArtifactError: needle.NeedleModelArtifactError,
+  hasNeedleModelArtifacts: vi.fn(() => true),
   createNeedleRuntime: () => needle.runtime,
 }));
 
@@ -154,6 +163,134 @@ describe("classifier", () => {
     expectTypeOf(currencyResult).toEqualTypeOf<"gbp" | "usd" | "eur">();
     await score.close();
     await currency.close();
+  });
+
+  it("rebuilds old numeric models from retained examples", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "old-numeric-model";
+    const config = {
+      name,
+      result: { type: "number" as const, min: 0, max: 1 },
+      retrainOnCount: 2,
+      acceptableError: "10%" as const,
+      retestInterval: 100,
+      retestRevertOn: 3,
+      model: "needle2" as const,
+      maxTrainingSet: 10,
+      dataDirectory,
+    };
+    const stored = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: config.maxTrainingSet,
+      config: {
+        result: config.result,
+        retrainOnCount: config.retrainOnCount,
+        acceptableError: 0.1,
+        retestInterval: config.retestInterval,
+        retestRevertOn: config.retestRevertOn,
+        model: config.model,
+      },
+    });
+    const [trainingInput, heldOutInput] = inputsForBothSplits(name);
+    stored.addExample(trainingInput, 0.92);
+    stored.addExample(heldOutInput, 0.92);
+    stored.markTrainingAttempted(2);
+    stored.promoteGeneration({
+      modelPath: "/tmp/old-numeric.cact",
+      needleVersion: "2.0.14",
+    });
+    stored.close();
+    needle.runtime.loadModel.mockClear();
+    needle.model.classify.mockResolvedValue(0.92);
+
+    const classifier = init(config);
+
+    expect(classifier.isTrained()).toBe(false);
+    await classifier.flush();
+    expect(needle.runtime.loadModel).not.toHaveBeenCalledWith(
+      expect.objectContaining({ modelPath: "/tmp/old-numeric.cact" }),
+    );
+    expect(needle.runtime.train).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generation: 2,
+        examples: [expect.objectContaining({ input: trainingInput })],
+      }),
+    );
+    expect(classifier.isTrained()).toBe(true);
+    const reopened = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: config.maxTrainingSet,
+      config: {
+        result: config.result,
+        retrainOnCount: config.retrainOnCount,
+        acceptableError: 0.1,
+        retestInterval: config.retestInterval,
+        retestRevertOn: config.retestRevertOn,
+        model: config.model,
+      },
+    });
+    expect(reopened.snapshot()).toMatchObject({
+      activeGeneration: 2,
+      trained: true,
+      activeExampleCount: 2,
+    });
+    reopened.close();
+    await classifier.close();
+  });
+
+  it("rebuilds a trained numeric model when its label sidecar cannot load", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "missing-number-labels";
+    const config = {
+      name,
+      result: { type: "number" as const, min: 0, max: 1 },
+      retrainOnCount: 2,
+      acceptableError: "10%" as const,
+      retestInterval: 100,
+      retestRevertOn: 3,
+      model: "needle2" as const,
+      maxTrainingSet: 10,
+      dataDirectory,
+    };
+    const stored = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: 10,
+      config: {
+        result: config.result,
+        retrainOnCount: 2,
+        acceptableError: 0.1,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+    });
+    const [trainingInput, heldOutInput] = inputsForBothSplits(name);
+    stored.addExample(trainingInput, 0.92);
+    stored.addExample(heldOutInput, 0.92);
+    stored.markTrainingAttempted(2);
+    stored.promoteGeneration({
+      modelPath: "/tmp/missing-labels.cact",
+      needleVersion: "2.0.14/number-buckets-v1",
+    });
+    stored.close();
+    const runtimeModule = await import("../src/runtime.js") as typeof import("../src/runtime.js") & {
+      hasNeedleModelArtifacts: ReturnType<typeof vi.fn>;
+    };
+    runtimeModule.hasNeedleModelArtifacts.mockReturnValueOnce(false);
+    needle.model.classify.mockResolvedValue(0.92);
+
+    const classifier = init(config);
+    expect(classifier.isTrained()).toBe(false);
+    await classifier.flush();
+
+    expect(classifier.isTrained()).toBe(true);
+    expect(needle.runtime.train).toHaveBeenCalledWith(
+      expect.objectContaining({ generation: 2 }),
+    );
+    await classifier.close();
   });
 
   it("trains, tests the exported model on held-out examples, then promotes it", async () => {
@@ -714,6 +851,44 @@ describe("classifier", () => {
     });
     expect(check.snapshot().clearPending).toBe(false);
     check.close();
+    await classifier.close();
+  });
+
+  it("recovers from a transient runtime startup failure without retiring the model", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "runtime-recovers";
+    const [trainingInput, heldOutInput] = inputsForBothSplits(name);
+    needle.runtime.ready.mockRejectedValueOnce(new Error("Python unavailable"));
+    const stored = openStorage({
+      dataDirectory,
+      name,
+      maxTrainingSet: 10,
+      config: {
+        result: { type: "boolean" },
+        retrainOnCount: 2,
+        acceptableError: 0,
+        retestInterval: 2,
+        retestRevertOn: 2,
+        model: "needle2",
+      },
+    });
+    stored.addExample(trainingInput, true);
+    stored.addExample(heldOutInput, true);
+    stored.promoteGeneration({
+      modelPath: "/tmp/transient-model.cact",
+      needleVersion: "2.0.14",
+    });
+    stored.close();
+    const classifier = init(booleanConfig(dataDirectory, name));
+
+    expect(classifier.isTrained()).toBe(true);
+    await expect(classifier.classify("after recovery")).resolves.toBe(true);
+    expect(needle.runtime.loadModel).toHaveBeenCalledWith(
+      expect.objectContaining({ modelPath: "/tmp/transient-model.cact" }),
+    );
+    await expect(classifier.flush()).rejects.toMatchObject({
+      code: "service_unavailable",
+    });
     await classifier.close();
   });
 
