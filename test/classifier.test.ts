@@ -14,6 +14,7 @@ import {
 } from "vitest";
 
 import { init } from "../src/index.js";
+import { SwapAIError } from "../src/errors.js";
 import { assignExampleSplit, openStorage } from "../src/storage.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
@@ -330,6 +331,33 @@ describe("classifier", () => {
     await expect(classifier.classify("manual only")).rejects.toMatchObject({
       code: "not_trained",
     });
+    await classifier.close();
+  });
+
+  it("rejects a candidate that cannot classify held-out examples and retries after the next batch", async () => {
+    const name = "classification-failed-candidate";
+    const [trainingInput, heldOutInput] = inputsForBothSplits(name);
+    const classificationFailure = new SwapAIError(
+      "classification_failed",
+      "Needle did not return exactly one classify call",
+    );
+    needle.model.classify
+      .mockRejectedValueOnce(classificationFailure)
+      .mockResolvedValue(true);
+    const classifier = init(booleanConfig(makeDirectory(), name));
+
+    classifier.logClassification(trainingInput, true);
+    classifier.logClassification(heldOutInput, true);
+    await expect(classifier.flush()).resolves.toBeUndefined();
+    expect(classifier.isTrained()).toBe(false);
+    expect(needle.runtime.train).toHaveBeenCalledTimes(1);
+
+    classifier.logClassification(`${trainingInput}-next`, true);
+    classifier.logClassification(`${heldOutInput}-next`, true);
+    await classifier.flush();
+
+    expect(needle.runtime.train).toHaveBeenCalledTimes(2);
+    expect(classifier.isTrained()).toBe(true);
     await classifier.close();
   });
 

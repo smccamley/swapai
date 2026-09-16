@@ -1,6 +1,6 @@
 {
   "name": "@swapai/core",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Replace paid classifiers with locally trained Needle 2 classifiers.",
   "type": "module",
   "license": "MIT",

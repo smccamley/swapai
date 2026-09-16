@@ -351,10 +351,21 @@ function createClassifier<const Config extends ResultConfig>(
       try {
         const comparisons = [];
         for (const example of heldOutExamples) {
-          const candidateResult = validateResult(
-            config.result,
-            await candidateModel.classify(example.input),
-          );
+          let candidateResult: Result;
+          try {
+            candidateResult = validateResult(
+              config.result,
+              await candidateModel.classify(example.input),
+            );
+          } catch (error) {
+            if (
+              error instanceof SwapAIError &&
+              error.code === "classification_failed"
+            ) {
+              return true;
+            }
+            throw error;
+          }
           comparisons.push({
             reference: validateResult(config.result, example.result),
             candidate: candidateResult,

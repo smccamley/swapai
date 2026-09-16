@@ -56,6 +56,14 @@ describe("Needle classifier format", () => {
     );
   });
 
+  it("keeps two observed numeric results as two Needle labels at 100% acceptable error", () => {
+    const config = { type: "number", min: 0, max: 1 } as const;
+
+    expect(
+      createNeedleNumberLabels([0.92, 0.08, 0.92, 0.08], config, 1).values,
+    ).toEqual([0.08, 0.92]);
+  });
+
   it("builds boolean and closed string classify tools", () => {
     expect(
       createNeedleTool({ type: "string", values: ["rabbit", "fish", "pig"] }),

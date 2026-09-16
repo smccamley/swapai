@@ -50,7 +50,7 @@ export function createNeedleNumberLabels(
     ? MAX_NEEDLE_NUMBER_LABELS
     : Math.min(
         MAX_NEEDLE_NUMBER_LABELS,
-        Math.max(1, Math.floor(1 / (2 * acceptableError)) + 1),
+        Math.max(2, Math.floor(1 / (2 * acceptableError)) + 1),
       );
   if (unique.length <= desiredLabelCount) return { values: unique };
 
