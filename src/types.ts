@@ -38,6 +38,7 @@ export type ReferenceClassifier<Result extends ResultValue> = (
 export interface Classifier<Result extends ResultValue> {
   isTrained(): boolean;
   logClassification(input: string, result: Result): void;
+  clearTrainingData(): void;
   classify(
     input: string,
     referenceClassifier?: ReferenceClassifier<Result>,

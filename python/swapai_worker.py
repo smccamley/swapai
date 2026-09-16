@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -28,52 +30,78 @@ def require_version(needle: Any) -> None:
         )
 
 
+@contextmanager
+def artifact_write_lock(args: argparse.Namespace):
+    lock_database = sqlite3.connect(args.artifact_lock_database, timeout=30)
+    main_database: sqlite3.Connection | None = None
+    try:
+        lock_database.execute("BEGIN IMMEDIATE")
+        main_database = sqlite3.connect(f"file:{args.main_database}?mode=ro", uri=True)
+        row = main_database.execute(
+            "SELECT data_epoch, clear_pending FROM classifiers WHERE name = ?",
+            (args.classifier_name,),
+        ).fetchone()
+        if row is None or row[0] != args.expected_epoch or row[1] != 0:
+            raise RuntimeError("Classifier training was superseded by data erasure")
+        yield
+    finally:
+        if main_database is not None:
+            main_database.close()
+        try:
+            lock_database.rollback()
+        finally:
+            lock_database.close()
+
+
 def train(args: argparse.Namespace) -> None:
-    import needle
-    from needle.model.finetune import build_main, finetune_local
+    with artifact_write_lock(args):
+        import needle
+        from needle.model.finetune import build_main, finetune_local
 
-    require_version(needle)
-    checkpoint_dir = Path(args.checkpoint_dir).resolve()
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = checkpoint_dir / "needle2.pkl"
-    output = Path(args.output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    adapter = output.parent / "swapai-lora.pkl"
-    with open(args.training_data, "r", encoding="utf-8") as handle:
-        example_count = sum(1 for line in handle if line.strip())
-    batch_size = min(16, max(1, (example_count + 9) // 10))
+        require_version(needle)
+        checkpoint_dir = Path(args.checkpoint_dir).resolve()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = checkpoint_dir / "needle2.pkl"
+        output = Path(args.output).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        training_data = Path(args.training_data).resolve()
+        training_data.write_text(sys.stdin.read(), encoding="utf-8")
+        adapter = output.parent / "swapai-lora.pkl"
+        with training_data.open("r", encoding="utf-8") as handle:
+            example_count = sum(1 for line in handle if line.strip())
+        batch_size = min(16, max(1, (example_count + 9) // 10))
 
-    finetune_local(
-        types.SimpleNamespace(
-            jsonl_path=str(Path(args.training_data).resolve()),
-            checkpoint=str(checkpoint),
-            epochs=args.epochs,
-            batch_size=batch_size,
-            lr=1e-4,
-            lora_rank=16,
-            lora_alpha=32.0,
-            max_len=1024,
-            val_split=0.0,
-            seed=0,
-            generate=0,
-            model="deepseek/deepseek-v4-flash",
-            workers=1,
-            checkpoint_dir=str(checkpoint_dir),
-            out=str(adapter),
-            qat_bits="auto",
+        finetune_local(
+            types.SimpleNamespace(
+                jsonl_path=str(training_data),
+                checkpoint=str(checkpoint),
+                epochs=args.epochs,
+                batch_size=batch_size,
+                lr=1e-4,
+                lora_rank=16,
+                lora_alpha=32.0,
+                max_len=1024,
+                val_split=0.0,
+                seed=0,
+                generate=0,
+                model="deepseek/deepseek-v4-flash",
+                workers=1,
+                checkpoint_dir=str(checkpoint_dir),
+                out=str(adapter),
+                qat_bits="auto",
+            )
         )
-    )
-    build_main(
-        types.SimpleNamespace(
-            checkpoint=str(checkpoint),
-            lora=str(adapter),
-            out=str(output),
-            upload=False,
-            bits=None,
+        build_main(
+            types.SimpleNamespace(
+                checkpoint=str(checkpoint),
+                lora=str(adapter),
+                out=str(output),
+                upload=False,
+                bits=None,
+            )
         )
-    )
-    if not output.is_file():
-        raise RuntimeError("Needle did not create the requested .cact model")
+        if not output.is_file():
+            raise RuntimeError("Needle did not create the requested .cact model")
 
 
 def classification_result(response: Any) -> Any:
@@ -147,6 +175,10 @@ def parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--output", required=True)
     train_parser.add_argument("--checkpoint-dir", required=True)
     train_parser.add_argument("--epochs", type=int, default=10)
+    train_parser.add_argument("--artifact-lock-database", required=True)
+    train_parser.add_argument("--main-database", required=True)
+    train_parser.add_argument("--classifier-name", required=True)
+    train_parser.add_argument("--expected-epoch", type=int, required=True)
 
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--model", required=True)

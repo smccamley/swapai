@@ -23,6 +23,7 @@ import type {
 
 const TRAINING_LEASE_DURATION_MS = 5 * 60 * 1000;
 const TRAINING_LEASE_RENEWAL_MS = 60 * 1000;
+const ARTIFACT_LOCK_WAIT_MS = 30_000;
 
 export function init<const Config extends ResultConfig>(
   inputConfig: InitConfig<Config>,
@@ -76,36 +77,78 @@ function createClassifier<const Config extends ResultConfig>(
 ): Classifier<ResultFor<Config>> {
   type Result = ResultFor<Config>;
 
+  const initialState = storage.snapshot();
   let closed = false;
-  let trained = storage.snapshot().trained;
+  let closing = false;
+  let closePromise: Promise<void> | null = null;
+  let trained = initialState.trained && !initialState.clearPending;
   let loadedModel: LoadedNeedleModel | null = null;
+  let loadedModelEpoch: number | null = null;
   let operationQueue: Promise<void> = Promise.resolve();
   let trainingQueue: Promise<void> = Promise.resolve();
   let trainingScheduled = false;
   const trainingLeaseOwner = `${process.pid}:${randomUUID()}`;
   let classificationQueue: Promise<void> = Promise.resolve();
   let queuedFailure: SwapAIError | null = null;
+  let clearFailure: SwapAIError | null = null;
+  let dataEpoch = initialState.dataEpoch;
+  let clearedEpoch = initialState.clearPending
+    ? initialState.dataEpoch - 1
+    : initialState.dataEpoch;
 
-  const saved = storage.snapshot();
+  const saved = initialState;
   if (
+    !saved.clearPending &&
     saved.trained &&
     (saved.modelPath === null || saved.needleVersion !== NEEDLE_VERSION)
   ) {
-    storage.archiveAndReset();
-    trained = false;
+    if (storage.archiveAndReset(saved.dataEpoch) !== null) {
+      const reset = storage.snapshot();
+      dataEpoch = reset.dataEpoch;
+      clearedEpoch = reset.dataEpoch;
+      trained = false;
+    }
   }
 
   const startup = startRuntime();
 
   async function startRuntime(): Promise<void> {
+    const startupEpoch = dataEpoch;
+    const beforeRuntime = storage.snapshot();
+    if (beforeRuntime.clearPending) {
+      trained = false;
+      dataEpoch = beforeRuntime.dataEpoch;
+      try {
+        await performDurableClear(beforeRuntime.dataEpoch);
+      } catch (error) {
+        rememberClearFailure(error);
+      }
+    }
     try {
       await runtime.ready();
       const snapshot = storage.snapshot();
+      if (snapshot.clearPending) {
+        trained = false;
+        dataEpoch = snapshot.dataEpoch;
+        return;
+      }
       if (snapshot.trained && snapshot.modelPath !== null) {
-        loadedModel = await runtime.loadModel({
+        const restoredModel = await runtime.loadModel({
           modelPath: snapshot.modelPath,
           resultConfig: config.result,
         });
+        const current = storage.snapshot();
+        if (
+          startupEpoch === current.dataEpoch &&
+          !current.clearPending &&
+          current.trained
+        ) {
+          loadedModel = restoredModel;
+          loadedModelEpoch = startupEpoch;
+          trained = true;
+        } else {
+          await restoredModel.close();
+        }
       }
     } catch (error) {
       const swapAIError = toSwapAIError(
@@ -122,6 +165,27 @@ function createClassifier<const Config extends ResultConfig>(
     reportBackgroundError(config, error);
   }
 
+  function rememberClearFailure(error: unknown): void {
+    clearFailure = toSwapAIError(
+      error,
+      "storage_failed",
+      `Could not completely clear classifier "${config.name}"`,
+    );
+    reportBackgroundError(config, clearFailure);
+  }
+
+  function refreshStoredState() {
+    const snapshot = storage.snapshot();
+    dataEpoch = snapshot.dataEpoch;
+    if (snapshot.clearPending) {
+      trained = false;
+    } else {
+      trained = snapshot.trained;
+      clearedEpoch = snapshot.dataEpoch;
+    }
+    return snapshot;
+  }
+
   function enqueue(operation: () => void | Promise<void>): Promise<void> {
     const result = operationQueue.then(operation);
     operationQueue = result.catch((error: unknown) => {
@@ -132,15 +196,23 @@ function createClassifier<const Config extends ResultConfig>(
     return result;
   }
 
-  function persistExample(input: string, result: Result): Promise<void> {
+  function persistExample(
+    input: string,
+    result: Result,
+    epoch = dataEpoch,
+  ): Promise<void> {
+    if (epoch !== dataEpoch) return Promise.resolve();
     return enqueue(() => {
-      storage.addExample(input, result);
-      scheduleTraining();
+      if (epoch !== dataEpoch) return;
+      if (storage.addExample(input, result, epoch) !== null) scheduleTraining();
     });
   }
 
   function shouldTrain(snapshot = storage.snapshot()): boolean {
     return (
+      clearedEpoch === dataEpoch &&
+      snapshot.dataEpoch === dataEpoch &&
+      !snapshot.clearPending &&
       !snapshot.trained &&
       snapshot.examplesUsedForTraining < config.maxTrainingSet &&
       snapshot.newExamplesSinceTraining >= config.retrainOnCount
@@ -167,38 +239,62 @@ function createClassifier<const Config extends ResultConfig>(
   }
 
   async function trainWhenDue(): Promise<boolean> {
+    const trainingEpoch = dataEpoch;
     if (!shouldTrain()) return false;
-    if (!storage.claimTrainingLease(trainingLeaseOwner, TRAINING_LEASE_DURATION_MS)) {
+    if (
+      !storage.claimTrainingLease(
+        trainingLeaseOwner,
+        TRAINING_LEASE_DURATION_MS,
+        trainingEpoch,
+      )
+    ) {
       return false;
     }
 
-    let leaseHeld = true;
-    const renewTrainingLease = (): boolean => {
-      if (!leaseHeld) return false;
+      let leaseHeld = true;
+      const renewTrainingLease = (): boolean => {
+        if (!leaseHeld) return false;
+        try {
+          leaseHeld = storage.claimTrainingLease(
+            trainingLeaseOwner,
+            TRAINING_LEASE_DURATION_MS,
+            trainingEpoch,
+          );
+        } catch {
+          leaseHeld = false;
+        }
+        return leaseHeld;
+      };
+      const leaseRenewal = setInterval(
+        renewTrainingLease,
+        TRAINING_LEASE_RENEWAL_MS,
+      );
+      leaseRenewal.unref();
+
       try {
-        leaseHeld = storage.claimTrainingLease(
-          trainingLeaseOwner,
-          TRAINING_LEASE_DURATION_MS,
-        );
-      } catch {
-        leaseHeld = false;
+        const snapshot = storage.snapshot();
+        if (!shouldTrain(snapshot)) return false;
+
+      if (
+        !storage.markTrainingAttempted(
+          snapshot.activeExampleCount,
+          trainingEpoch,
+        )
+      ) {
+        return false;
       }
-      return leaseHeld;
-    };
-    const leaseRenewal = setInterval(
-      renewTrainingLease,
-      TRAINING_LEASE_RENEWAL_MS,
-    );
-    leaseRenewal.unref();
+      const trainingExamples = storage.listExamplesForTraining(
+        "training",
+        snapshot.activeGeneration,
+        trainingEpoch,
+      );
+      const heldOutExamples = storage.listExamplesForTraining(
+        "held_out",
+        snapshot.activeGeneration,
+        trainingEpoch,
+      );
 
-    try {
-      const snapshot = storage.snapshot();
-      if (!shouldTrain(snapshot)) return false;
-
-      const trainingExamples = storage.listExamples("training");
-      const heldOutExamples = storage.listExamples("held_out");
-      storage.markTrainingAttempted(snapshot.activeExampleCount);
-
+      if (trainingExamples === null || heldOutExamples === null) return false;
       if (trainingExamples.length === 0 || heldOutExamples.length === 0) {
         return true;
       }
@@ -206,6 +302,7 @@ function createClassifier<const Config extends ResultConfig>(
       const candidate = await runtime.train({
         classifierName: config.name,
         generation: snapshot.activeGeneration,
+        expectedEpoch: trainingEpoch,
         examples: trainingExamples.map(({ input, result }) => ({ input, result })),
         resultConfig: config.result,
       });
@@ -232,47 +329,102 @@ function createClassifier<const Config extends ResultConfig>(
         }
 
         if (!renewTrainingLease()) {
+          const current = refreshStoredState();
+          if (
+            current.dataEpoch !== trainingEpoch ||
+            current.clearPending
+          ) {
+            await runtime.clearClassifierGenerationArtifacts(
+              config.name,
+              snapshot.activeGeneration,
+            );
+            return false;
+          }
           throw new SwapAIError(
             "service_unavailable",
             `Classifier "${config.name}" lost its training lease`,
           );
         }
 
-        storage.promoteGeneration(candidate);
+        if (trainingEpoch !== refreshStoredState().dataEpoch) {
+          await runtime.clearClassifierGenerationArtifacts(
+            config.name,
+            snapshot.activeGeneration,
+          );
+          return false;
+        }
+        if (storage.promoteGeneration(candidate, trainingEpoch) === null) {
+          await runtime.clearClassifierGenerationArtifacts(
+            config.name,
+            snapshot.activeGeneration,
+          );
+          return false;
+        }
         if (loadedModel !== null) await loadedModel.close();
+        if (trainingEpoch !== refreshStoredState().dataEpoch) {
+          await runtime.clearClassifierGenerationArtifacts(
+            config.name,
+            snapshot.activeGeneration,
+          );
+          return false;
+        }
         loadedModel = candidateModel;
+        loadedModelEpoch = trainingEpoch;
         trained = true;
         return true;
       } finally {
         if (loadedModel !== candidateModel) await candidateModel.close();
       }
-    } finally {
-      clearInterval(leaseRenewal);
-      storage.releaseTrainingLease(trainingLeaseOwner);
-    }
+      } finally {
+        clearInterval(leaseRenewal);
+        storage.releaseTrainingLease(trainingLeaseOwner);
+      }
   }
 
-  async function model(): Promise<LoadedNeedleModel> {
+  async function model(expectedEpoch: number): Promise<LoadedNeedleModel> {
     await startup;
-    if (!trained) {
+    const current = refreshStoredState();
+    if (
+      !trained ||
+      current.clearPending ||
+      current.dataEpoch !== expectedEpoch
+    ) {
       throw new SwapAIError(
         "not_trained",
         `Classifier "${config.name}" has not passed its held-out test`,
       );
     }
+    if (loadedModel !== null && loadedModelEpoch !== expectedEpoch) {
+      await loadedModel.close();
+      loadedModel = null;
+      loadedModelEpoch = null;
+    }
     if (loadedModel === null) {
-      const snapshot = storage.snapshot();
-      if (snapshot.modelPath === null) {
+      if (current.modelPath === null) {
         throw new SwapAIError(
           "service_unavailable",
           `Classifier "${config.name}" is trained but has no saved model`,
         );
       }
       await runtime.ready();
-      loadedModel = await runtime.loadModel({
-        modelPath: snapshot.modelPath,
+      const restored = await runtime.loadModel({
+        modelPath: current.modelPath,
         resultConfig: config.result,
       });
+      const afterLoad = refreshStoredState();
+      if (
+        afterLoad.dataEpoch !== expectedEpoch ||
+        afterLoad.clearPending ||
+        !afterLoad.trained
+      ) {
+        await restored.close();
+        throw new SwapAIError(
+          "not_trained",
+          `Classifier "${config.name}" has been cleared`,
+        );
+      }
+      loadedModel = restored;
+      loadedModelEpoch = expectedEpoch;
     }
     return loadedModel;
   }
@@ -289,6 +441,7 @@ function createClassifier<const Config extends ResultConfig>(
     reference: ReferenceClassifier<Result> | undefined,
     candidateError: unknown,
     retestDue: boolean,
+    epoch: number,
   ): Promise<Result> {
     if (reference === undefined) {
       throw toSwapAIError(
@@ -306,26 +459,31 @@ function createClassifier<const Config extends ResultConfig>(
       ),
     );
     const referenceResult = await callReference(input, reference);
-    await persistExample(input, referenceResult);
-    if (retestDue) {
-      storage.recordLocalClassification();
-      const failures = storage.recordRetest(false);
-      if (failures >= config.retestRevertOn) await disableModel();
+    await persistExample(input, referenceResult, epoch);
+    if (retestDue && epoch === dataEpoch) {
+      if (storage.recordLocalClassification(epoch) === null) return referenceResult;
+      const failures = storage.recordRetest(false, epoch);
+      if (failures !== null && failures >= config.retestRevertOn) {
+        await disableModel(epoch);
+      }
     }
     return referenceResult;
   }
 
-  async function disableModel(): Promise<void> {
-    storage.archiveAndReset();
+  async function disableModel(epoch: number): Promise<void> {
+    if (storage.archiveAndReset(epoch) === null) return;
+    refreshStoredState();
     trained = false;
     const previousModel = loadedModel;
     loadedModel = null;
+    loadedModelEpoch = null;
     if (previousModel !== null) await previousModel.close();
   }
 
   async function classifyNow(
     input: string,
     reference: ReferenceClassifier<Result> | undefined,
+    epoch: number,
   ): Promise<Result> {
     assertOpen(closed);
 
@@ -337,7 +495,7 @@ function createClassifier<const Config extends ResultConfig>(
         );
       }
       const referenceResult = await callReference(input, reference);
-      await persistExample(input, referenceResult);
+      await persistExample(input, referenceResult, epoch);
       return referenceResult;
     }
 
@@ -350,46 +508,232 @@ function createClassifier<const Config extends ResultConfig>(
     try {
       candidateResult = validateResult(
         config.result,
-        await (await model()).classify(input),
+        await (await model(epoch)).classify(input),
       );
     } catch (error) {
-      return fallbackToReference(input, reference, error, retestDue);
+      return fallbackToReference(input, reference, error, retestDue, epoch);
+    }
+
+    const afterClassification = refreshStoredState();
+    if (
+      afterClassification.dataEpoch !== epoch ||
+      afterClassification.clearPending
+    ) {
+      return fallbackToReference(
+        input,
+        reference,
+        new SwapAIError(
+          "not_trained",
+          `Classifier "${config.name}" was cleared during classification`,
+        ),
+        retestDue,
+        epoch,
+      );
     }
 
     if (!retestDue || reference === undefined) {
-      storage.recordLocalClassification();
+      if (
+        epoch !== dataEpoch ||
+        storage.recordLocalClassification(epoch) === null
+      ) {
+        return fallbackToReference(
+          input,
+          reference,
+          new SwapAIError(
+            "not_trained",
+            `Classifier "${config.name}" was cleared before returning its result`,
+          ),
+          retestDue,
+          epoch,
+        );
+      }
       return candidateResult;
     }
 
     const referenceResult = await callReference(input, reference);
-    await persistExample(input, referenceResult);
-    storage.recordLocalClassification();
+    await persistExample(input, referenceResult, epoch);
+    if (epoch !== dataEpoch) return referenceResult;
+    if (storage.recordLocalClassification(epoch) === null) return referenceResult;
     const passed =
       resultError(config.result, referenceResult, candidateResult) <=
       config.acceptableError;
-    const failures = storage.recordRetest(passed);
+    const failures = storage.recordRetest(passed, epoch);
 
-    if (!passed && failures >= config.retestRevertOn) {
-      await disableModel();
+    if (
+      !passed &&
+      failures !== null &&
+      failures >= config.retestRevertOn
+    ) {
+      await disableModel(epoch);
     }
 
     return referenceResult;
   }
 
+  async function performDurableClear(clearEpoch: number): Promise<void> {
+    trained = false;
+    const deletionFailures: unknown[] = [];
+    const throwDeletionFailures = (): void => {
+      if (deletionFailures.length === 1) throw deletionFailures[0];
+      if (deletionFailures.length > 1) {
+        throw new AggregateError(
+          deletionFailures,
+          `Could not completely clear classifier "${config.name}"`,
+        );
+      }
+    };
+    const previousModel = loadedModel;
+    if (previousModel !== null) {
+      try {
+        await previousModel.close();
+        if (loadedModel === previousModel) {
+          loadedModel = null;
+          loadedModelEpoch = null;
+        }
+      } catch (error) {
+        deletionFailures.push(error);
+      }
+    }
+
+    const lockWaitStarted = Date.now();
+    let clearState = refreshStoredState();
+    while (
+      clearState.clearPending &&
+      clearState.dataEpoch === clearEpoch &&
+      ((clearState.trainingLeaseOwner !== null &&
+        clearState.trainingLeaseEpoch === null &&
+        clearState.trainingLeaseUntil !== null &&
+        clearState.trainingLeaseUntil > Date.now()) ||
+        !storage.claimArtifactWriteLock())
+    ) {
+      if (Date.now() - lockWaitStarted >= ARTIFACT_LOCK_WAIT_MS) {
+        throw new SwapAIError(
+          "storage_failed",
+          `Timed out waiting to clear classifier "${config.name}" while training was still running`,
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      clearState = refreshStoredState();
+    }
+
+    if (!clearState.clearPending || clearState.dataEpoch !== clearEpoch) {
+      throwDeletionFailures();
+      return;
+    }
+    try {
+      try {
+        storage.eraseTrainingData(clearEpoch);
+      } catch (error) {
+        deletionFailures.push(error);
+      }
+      clearState = refreshStoredState();
+      if (
+        clearState.clearPending &&
+        clearState.dataEpoch === clearEpoch &&
+        clearState.clearErased &&
+        clearState.clearArtifactGenerationMax !== null
+      ) {
+        try {
+          await runtime.clearClassifierArtifactsThroughGeneration(
+            config.name,
+            clearState.clearArtifactGenerationMax,
+          );
+        } catch (error) {
+          deletionFailures.push(error);
+        }
+      }
+      throwDeletionFailures();
+
+      storage.finishClearTrainingData(clearEpoch);
+      const current = refreshStoredState();
+      if (!current.clearPending) {
+        clearFailure = null;
+        clearedEpoch = current.dataEpoch;
+      }
+    } finally {
+      storage.releaseArtifactWriteLock();
+    }
+  }
+
+  async function flushNow(): Promise<void> {
+    const clearFailureBeforeFlush = clearFailure;
+    await startup;
+    while (true) {
+      const operations = operationQueue;
+      await operations;
+      const training = trainingQueue;
+      await training;
+      if (operations === operationQueue && training === trainingQueue) break;
+    }
+    if (
+      clearFailure !== null &&
+      clearFailure !== clearFailureBeforeFlush
+    ) {
+      throw clearFailure;
+    }
+    const pending = refreshStoredState();
+    if (pending.clearPending || clearFailureBeforeFlush !== null) {
+      try {
+        await performDurableClear(pending.dataEpoch);
+        if (!refreshStoredState().clearPending) clearFailure = null;
+      } catch (error) {
+        rememberClearFailure(error);
+      }
+    }
+    if (refreshStoredState().clearPending) {
+      clearFailure ??= new SwapAIError(
+        "storage_failed",
+        `Could not completely clear classifier "${config.name}"`,
+      );
+      throw clearFailure;
+    }
+    if (clearFailure !== null) throw clearFailure;
+    if (queuedFailure !== null) {
+      const failure = queuedFailure;
+      queuedFailure = null;
+      throw failure;
+    }
+  }
+
   const classifier: Classifier<Result> = {
     isTrained() {
+      assertOpen(closed || closing);
+      refreshStoredState();
       return trained;
     },
 
     logClassification(input, result) {
-      assertOpen(closed);
+      assertOpen(closed || closing);
       const validResult = validateResult(config.result, result);
-      void persistExample(input, validResult);
+      const epoch = refreshStoredState().dataEpoch;
+      void persistExample(input, validResult, epoch);
+    },
+
+    clearTrainingData() {
+      assertOpen(closed || closing);
+      trained = false;
+      const clearEpoch = storage.beginClearTrainingData();
+      dataEpoch = clearEpoch;
+      const trainingBeforeClear = trainingQueue;
+      const classificationsBeforeClear = classificationQueue;
+      void enqueue(async () => {
+        await startup;
+        await trainingBeforeClear;
+        await classificationsBeforeClear;
+        try {
+          await performDurableClear(clearEpoch);
+        } catch (error) {
+          rememberClearFailure(error);
+        }
+      });
     },
 
     classify(input, reference) {
-      assertOpen(closed);
-      const task = classificationQueue.then(() => classifyNow(input, reference));
+      assertOpen(closed || closing);
+      const epoch = refreshStoredState().dataEpoch;
+      const task = classificationQueue.then(() =>
+        classifyNow(input, reference, epoch),
+      );
       classificationQueue = task.then(
         () => undefined,
         () => undefined,
@@ -398,37 +742,54 @@ function createClassifier<const Config extends ResultConfig>(
     },
 
     async flush() {
-      await startup;
-      while (true) {
-        const operations = operationQueue;
-        await operations;
-        const training = trainingQueue;
-        await training;
-        if (operations === operationQueue && training === trainingQueue) break;
-      }
-      if (queuedFailure !== null) {
-        const failure = queuedFailure;
-        queuedFailure = null;
-        throw failure;
-      }
+      assertOpen(closed || closing);
+      await flushNow();
     },
 
-    async close() {
-      if (closed) return;
-      closed = true;
-      let failure: unknown;
-      try {
-        await classificationQueue;
-        await classifier.flush();
-      } catch (error) {
-        failure = error;
-      } finally {
-        if (loadedModel !== null) await loadedModel.close();
+    close() {
+      if (closed) return Promise.resolve();
+      if (closePromise !== null) return closePromise;
+      closing = true;
+      closePromise = (async () => {
+        try {
+          await classificationQueue;
+          await flushNow();
+        } catch (error) {
+          closing = false;
+          closePromise = null;
+          throw error;
+        }
+        const failures: unknown[] = [];
+        if (loadedModel !== null) {
+          try {
+            await loadedModel.close();
+          } catch (error) {
+            failures.push(error);
+          }
+        }
         loadedModel = null;
-        await runtime.close();
-        storage.close();
-      }
-      if (failure !== undefined) throw failure;
+        loadedModelEpoch = null;
+        try {
+          await runtime.close();
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          storage.close();
+        } catch (error) {
+          failures.push(error);
+        }
+        closed = true;
+        closing = false;
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) {
+          throw new AggregateError(
+            failures,
+            `Could not completely close classifier "${config.name}"`,
+          );
+        }
+      })();
+      return closePromise;
     },
   };
 

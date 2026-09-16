@@ -11,6 +11,7 @@ function classifierWith(
   return {
     isTrained: () => true,
     logClassification: () => undefined,
+    clearTrainingData: () => undefined,
     classify: run,
     flush: () => Promise.resolve(),
     close: () => Promise.resolve(),

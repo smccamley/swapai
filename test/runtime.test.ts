@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
@@ -12,11 +13,14 @@ import {
   type NeedleSpawn,
   type RunCommand,
 } from "../src/runtime.js";
+import { openStorage } from "../src/storage.js";
+
+const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
 async function makeFakeCommands(dataDirectory: string) {
   const calls: Array<{ command: string; args: readonly string[] }> = [];
 
-  const runCommand: RunCommand = async (command, args) => {
+  const runCommand: RunCommand = async (command, args, options) => {
     calls.push({ command, args });
 
     if (args[0] === "venv") {
@@ -31,6 +35,8 @@ async function makeFakeCommands(dataDirectory: string) {
 
     const outputIndex = args.indexOf("--output");
     if (outputIndex >= 0) {
+      const trainingIndex = args.indexOf("--training-data");
+      await writeFile(args[trainingIndex + 1]!, options?.stdin ?? "");
       await writeFile(args[outputIndex + 1]!, "fake cact");
     }
 
@@ -46,7 +52,7 @@ class FakeNeedleProcess extends EventEmitter {
   readonly stdin: Writable;
   readonly requests: unknown[] = [];
 
-  constructor() {
+  constructor(private readonly stops = true) {
     super();
     let buffered = "";
     this.stdin = new Writable({
@@ -68,7 +74,7 @@ class FakeNeedleProcess extends EventEmitter {
             );
           } else if (request.type === "close") {
             this.stdout.write(`${JSON.stringify({ type: "closed" })}\n`);
-            queueMicrotask(() => this.emit("exit", 0, null));
+            if (this.stops) queueMicrotask(() => this.emit("exit", 0, null));
           }
         }
         callback();
@@ -81,8 +87,8 @@ class FakeNeedleProcess extends EventEmitter {
     });
   }
 
-  kill() {
-    this.emit("exit", null, "SIGTERM");
+  kill(signal?: NodeJS.Signals) {
+    if (this.stops) this.emit("exit", null, signal ?? "SIGTERM");
     return true;
   }
 }
@@ -180,13 +186,14 @@ describe("managed Needle runtime", () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-train-"));
     const fake = await makeFakeCommands(dataDirectory);
     const runtime = createNeedleRuntime({
-      dataDirectory,
+      dataDirectory: relative(process.cwd(), dataDirectory),
       dependencies: { runCommand: fake.runCommand },
     });
 
     const trained = await runtime.train({
       classifierName: "accountant/relevance",
       generation: 2,
+      expectedEpoch: 0,
       examples: [
         { input: "I owe you £5", result: true },
         { input: "Sunny outside", result: false },
@@ -203,13 +210,189 @@ describe("managed Needle runtime", () => {
     const trainCall = fake.calls.find((call) => call.args.includes("train"));
     expect(trainCall).toBeDefined();
     const trainingPath = trainCall!.args[trainCall!.args.indexOf("--training-data") + 1]!;
+    expect(isAbsolute(trainingPath)).toBe(true);
     const rows = (await readFile(trainingPath, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
     expect(rows).toHaveLength(2);
     expect(rows[0].answers[0].arguments.result).toBe(true);
+    expect(trainCall!.args).toEqual(
+      expect.arrayContaining([
+        "--artifact-lock-database",
+        "--main-database",
+        "--classifier-name",
+        "accountant/relevance",
+        "--expected-epoch",
+        "0",
+      ]),
+    );
 
+    await runtime.close();
+  });
+
+  it("keeps the artifact lock in the training command after its parent storage closes", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-child-lock-"));
+    const name = "orphan-safe-training";
+    const storageOptions = {
+      dataDirectory,
+      name,
+      maxTrainingSet: 10,
+      config: {
+        result: { type: "boolean" as const },
+        retrainOnCount: 2,
+        acceptableError: 0,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+    };
+    const parentStorage = openStorage(storageOptions);
+    const fake = await makeFakeCommands(dataDirectory);
+    let signalLockHeld!: () => void;
+    const lockHeld = new Promise<void>((resolve) => {
+      signalLockHeld = resolve;
+    });
+    let releaseTraining!: () => void;
+    const trainingReleased = new Promise<void>((resolve) => {
+      releaseTraining = resolve;
+    });
+    const runCommand: RunCommand = async (command, args, options) => {
+      if (!args.includes("train")) return fake.runCommand(command, args, options);
+      const lockPath = args[args.indexOf("--artifact-lock-database") + 1]!;
+      const childLock = new DatabaseSync(lockPath);
+      childLock.exec("BEGIN IMMEDIATE");
+      signalLockHeld();
+      await trainingReleased;
+      const trainingPath = args[args.indexOf("--training-data") + 1]!;
+      const outputPath = args[args.indexOf("--output") + 1]!;
+      await mkdir(dirname(outputPath), { recursive: true });
+      await writeFile(trainingPath, options?.stdin ?? "");
+      await writeFile(outputPath, "fake cact");
+      childLock.exec("COMMIT");
+      childLock.close();
+      return { stdout: "", stderr: "" };
+    };
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand },
+    });
+    const training = runtime.train({
+      classifierName: name,
+      generation: 1,
+      expectedEpoch: 0,
+      examples: [{ input: "private input", result: true }],
+      resultConfig: { type: "boolean" },
+    });
+    await lockHeld;
+
+    parentStorage.close();
+    const clearer = openStorage(storageOptions);
+    clearer.beginClearTrainingData();
+    expect(clearer.claimArtifactWriteLock()).toBe(false);
+    releaseTraining();
+    await training;
+    expect(clearer.claimArtifactWriteLock()).toBe(true);
+    clearer.releaseArtifactWriteLock();
+    clearer.close();
+    await runtime.close();
+  });
+
+  it("deletes one classifier's artifacts without deleting other classifiers or the managed runtime", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-clear-"));
+    const fake = await makeFakeCommands(dataDirectory);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand },
+    });
+    const removed = await runtime.train({
+      classifierName: "customer-to-remove",
+      generation: 1,
+      expectedEpoch: 0,
+      examples: [{ input: "private input", result: true }],
+      resultConfig: { type: "boolean" },
+    });
+    const preserved = await runtime.train({
+      classifierName: "other-customer",
+      generation: 1,
+      expectedEpoch: 0,
+      examples: [{ input: "other input", result: false }],
+      resultConfig: { type: "boolean" },
+    });
+
+    await runtime.clearClassifierArtifacts("customer-to-remove");
+
+    await expect(readFile(removed.modelPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(preserved.modelPath, "utf8")).resolves.toBe(
+      "fake cact",
+    );
+    await expect(
+      readFile(
+        join(
+          dataDirectory,
+          "runtime",
+          `needle-${NEEDLE_VERSION}`,
+          "installed.json",
+        ),
+        "utf8",
+      ),
+    ).resolves.toContain(NEEDLE_VERSION);
+    await runtime.close();
+  });
+
+  it("deletes one stale classifier generation without deleting its current generation", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-generation-clear-"));
+    const fake = await makeFakeCommands(dataDirectory);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand },
+    });
+    const stale = await runtime.train({
+      classifierName: "shared-classifier",
+      generation: 1,
+      expectedEpoch: 0,
+      examples: [{ input: "stale input", result: true }],
+      resultConfig: { type: "boolean" },
+    });
+    const current = await runtime.train({
+      classifierName: "shared-classifier",
+      generation: 2,
+      expectedEpoch: 0,
+      examples: [{ input: "current input", result: false }],
+      resultConfig: { type: "boolean" },
+    });
+
+    await runtime.clearClassifierArtifactsThroughGeneration(
+      "shared-classifier",
+      1,
+    );
+
+    await expect(readFile(stale.modelPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(current.modelPath, "utf8")).resolves.toBe("fake cact");
+    await runtime.close();
+  });
+
+  it("rejects unsafe classifier generation deletion values", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-generation-path-"));
+    const fake = await makeFakeCommands(dataDirectory);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand },
+    });
+
+    await expect(
+      runtime.clearClassifierGenerationArtifacts("classifier", -1),
+    ).rejects.toThrow(/non-negative safe integer/i);
+    await expect(
+      runtime.clearClassifierGenerationArtifacts(
+        "classifier",
+        Number.MAX_SAFE_INTEGER + 1,
+      ),
+    ).rejects.toThrow(/non-negative safe integer/i);
     await runtime.close();
   });
 
@@ -240,6 +423,30 @@ describe("managed Needle runtime", () => {
     await model.close();
     expect(worker.requests).toContainEqual({ type: "close" });
     await runtime.close();
+  });
+
+  it("reports failure when a model worker remains alive after SIGKILL", async () => {
+    vi.useFakeTimers();
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-stubborn-model-"));
+    const fake = await makeFakeCommands(dataDirectory);
+    const worker = new FakeNeedleProcess(false);
+    const spawnProcess: NeedleSpawn = vi.fn(() => worker);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand, spawnProcess },
+    });
+    const modelPath = join(dataDirectory, "model.cact");
+    await writeFile(modelPath, "fake cact");
+    const model = await runtime.loadModel({
+      modelPath,
+      resultConfig: { type: "boolean" },
+    });
+
+    const closing = model.close();
+    const rejected = expect(closing).rejects.toThrow(/SIGKILL/i);
+    await vi.advanceTimersByTimeAsync(9_100);
+    await rejected;
+    vi.useRealTimers();
   });
 
   it("keeps all caches and telemetry controls inside dataDirectory", async () => {

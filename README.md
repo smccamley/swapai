@@ -56,6 +56,27 @@ return score;
 result immediately and queues storage work. Use `await relevance.flush()` when
 you need to know all accepted examples are durable, such as during shutdown.
 
+## Delete one classifier's training data
+
+```ts
+relevance.clearTrainingData();
+await relevance.flush();
+```
+
+`clearTrainingData()` is synchronous and makes `isTrained()` return `false`
+immediately. It queues deletion of every retained example and saved model for
+this classifier name. `flush()` resolves after deletion is durable. Other
+classifiers and SwapAI's shared Needle runtime are left intact.
+
+A local classification already in progress cannot return an old-epoch result
+after the clear. It falls back to the supplied reference classifier, or rejects
+with `not_trained` when no reference was supplied. Its old-epoch result is not
+retained. Calls made after deletion finishes can build a new training set.
+
+If deletion cannot finish, `flush()` rejects and keeps the clear pending. A
+later `flush()` retries it. If the process exits, the next `init()` for that
+classifier finishes the pending deletion before any saved model can be used.
+
 ## Result types
 
 SwapAI supports bounded numbers, booleans, and a closed list of strings:

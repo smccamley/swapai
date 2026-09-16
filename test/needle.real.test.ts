@@ -5,15 +5,30 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createNeedleRuntime } from "../src/runtime.js";
+import { openStorage } from "../src/storage.js";
 
 describe("real Needle 2 runtime", () => {
   it("trains, exports, loads, and classifies with a real .cact", async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-real-needle-"));
+    const storage = openStorage({
+      dataDirectory,
+      name: "real-boolean-smoke-test",
+      maxTrainingSet: 100,
+      config: {
+        result: { type: "boolean" },
+        retrainOnCount: 2,
+        acceptableError: 0,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+    });
     const runtime = createNeedleRuntime({ dataDirectory });
     try {
       const model = await runtime.train({
         classifierName: "real-boolean-smoke-test",
         generation: 1,
+        expectedEpoch: 0,
         resultConfig: { type: "boolean" },
         examples: Array.from({ length: 32 }, (_, index) => ({
           input: `Classify this as true for accounting relevance or false otherwise: ${
@@ -42,6 +57,7 @@ describe("real Needle 2 runtime", () => {
       }
     } finally {
       await runtime.close();
+      storage.close();
       await rm(dataDirectory, { recursive: true, force: true });
     }
   });

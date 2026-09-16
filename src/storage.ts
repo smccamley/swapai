@@ -52,6 +52,13 @@ export interface StorageSnapshot {
   trained: boolean;
   modelPath: string | null;
   needleVersion: string | null;
+  dataEpoch: number;
+  clearPending: boolean;
+  clearErased: boolean;
+  clearArtifactGenerationMax: number | null;
+  trainingLeaseOwner: string | null;
+  trainingLeaseEpoch: number | null;
+  trainingLeaseUntil: number | null;
 }
 
 export interface PromotedModel {
@@ -62,15 +69,37 @@ export interface PromotedModel {
 export interface Storage {
   readonly databasePath: string;
   snapshot(): StorageSnapshot;
-  addExample(input: string, result: StoredResult): StoredExample;
+  addExample(
+    input: string,
+    result: StoredResult,
+    expectedDataEpoch?: number,
+  ): StoredExample | null;
   listExamples(split?: ExampleSplit, generation?: number): StoredExample[];
-  markTrainingAttempted(exampleCount: number): void;
-  promoteGeneration(model: PromotedModel): StoredGeneration;
-  recordLocalClassification(): number;
-  recordRetest(passed: boolean): number;
-  claimTrainingLease(owner: string, durationMs: number): boolean;
+  listExamplesForTraining(
+    split: ExampleSplit,
+    generation: number,
+    expectedDataEpoch: number,
+  ): StoredExample[] | null;
+  markTrainingAttempted(exampleCount: number, expectedDataEpoch?: number): boolean;
+  promoteGeneration(
+    model: PromotedModel,
+    expectedDataEpoch?: number,
+  ): StoredGeneration | null;
+  recordLocalClassification(expectedDataEpoch?: number): number | null;
+  recordRetest(passed: boolean, expectedDataEpoch?: number): number | null;
+  claimTrainingLease(
+    owner: string,
+    durationMs: number,
+    expectedDataEpoch?: number,
+  ): boolean;
   releaseTrainingLease(owner: string): void;
-  archiveAndReset(): StoredGeneration;
+  archiveAndReset(expectedDataEpoch?: number): StoredGeneration | null;
+  beginClearTrainingData(): number;
+  eraseTrainingData(dataEpoch: number): StoredGeneration | null;
+  finishClearTrainingData(dataEpoch: number): boolean;
+  clearTrainingData(): StoredGeneration;
+  claimArtifactWriteLock(): boolean;
+  releaseArtifactWriteLock(): void;
   listGenerations(): StoredGeneration[];
   close(): void;
 }
@@ -91,6 +120,13 @@ interface ClassifierRow {
   model_path: string | null;
   needle_version: string | null;
   active_example_count: number;
+  data_epoch: number;
+  clear_pending: number;
+  clear_erased: number;
+  clear_artifact_generation_max: number | null;
+  training_lease_owner: string | null;
+  training_lease_epoch: number | null;
+  training_lease_until: number | null;
 }
 
 interface ExampleRow {
@@ -129,7 +165,12 @@ const SCHEMA = `
     training_lease_owner TEXT,
     training_lease_until INTEGER,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    data_epoch INTEGER NOT NULL DEFAULT 0,
+    clear_pending INTEGER NOT NULL DEFAULT 0,
+    clear_erased INTEGER NOT NULL DEFAULT 0,
+    clear_artifact_generation_max INTEGER,
+    training_lease_epoch INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS generations (
@@ -161,6 +202,43 @@ const SCHEMA = `
     ON examples(classifier_name, generation, id);
   CREATE INDEX IF NOT EXISTS examples_by_split
     ON examples(classifier_name, generation, split, id);
+
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_insert
+    BEFORE INSERT ON classifiers
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_update
+    BEFORE UPDATE ON classifiers
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_delete
+    BEFORE DELETE ON classifiers
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_generations_insert
+    BEFORE INSERT ON generations
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_generations_update
+    BEFORE UPDATE ON generations
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_generations_delete
+    BEFORE DELETE ON generations
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_examples_insert
+    BEFORE INSERT ON examples
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_examples_update
+    BEFORE UPDATE ON examples
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+  CREATE TRIGGER IF NOT EXISTS swapai_v2_examples_delete
+    BEFORE DELETE ON examples
+    WHEN swapai_writer_version() < 2
+    BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
 `;
 
 export function assignExampleSplit(name: string, input: string): ExampleSplit {
@@ -182,49 +260,97 @@ export function openStorage(options: OpenStorageOptions): Storage {
   chmodSync(options.dataDirectory, 0o700);
   const databasePath = join(options.dataDirectory, "swapai.sqlite");
   const database = new DatabaseSync(databasePath);
-  chmodSync(databasePath, 0o600);
-  database.exec("PRAGMA journal_mode = WAL");
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA busy_timeout = 5000");
-  database.exec(SCHEMA);
-
-  const now = Date.now();
-  const configJson = stringifyJson(options.config, "classifier config");
-  const existing = database.prepare(`
-    SELECT config_json FROM classifiers WHERE name = ?
-  `).get(options.name) as { config_json: string } | undefined;
-
-  if (
-    existing !== undefined
-    && criticalConfigJson(existing.config_json) !== criticalConfigJson(configJson)
-  ) {
-    database.close();
-    throw new TypeError(
-      `Classifier "${options.name}" already exists with different result or behavior settings`,
+  let artifactLockDatabase: DatabaseSyncType | null = null;
+  try {
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 2,
     );
+    chmodSync(databasePath, 0o600);
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA secure_delete = ON");
+    database.exec("PRAGMA busy_timeout = 5000");
+    const secureDelete = requiredRow<{ secure_delete: number }>(
+      database.prepare("PRAGMA secure_delete").get(),
+    );
+    if (secureDelete.secure_delete !== 1) {
+      throw new Error("SQLite secure deletion could not be enabled");
+    }
+    database.exec(SCHEMA);
+    migrateClassifierColumns(database);
+    const lockDirectory = join(options.dataDirectory, "locks");
+    mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(lockDirectory, 0o700);
+    const lockPath = join(
+      lockDirectory,
+      `${createHash("sha256").update(options.name).digest("hex")}.sqlite`,
+    );
+    artifactLockDatabase = new DatabaseSync(lockPath);
+    chmodSync(lockPath, 0o600);
+    artifactLockDatabase.exec("PRAGMA busy_timeout = 0");
+    artifactLockDatabase.exec(
+      "CREATE TABLE IF NOT EXISTS artifact_lock (id INTEGER PRIMARY KEY)",
+    );
+
+    const now = Date.now();
+    const configJson = stringifyJson(options.config, "classifier config");
+    const existing = database.prepare(`
+      SELECT config_json FROM classifiers WHERE name = ?
+    `).get(options.name) as { config_json: string } | undefined;
+
+    if (
+      existing !== undefined
+      && criticalConfigJson(existing.config_json) !== criticalConfigJson(configJson)
+    ) {
+      throw new TypeError(
+        `Classifier "${options.name}" already exists with different result or behavior settings`,
+      );
+    }
+
+    transaction(database, () => {
+      database.prepare(`
+        INSERT INTO classifiers (
+          name, config_json, max_training_set, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+          config_json = excluded.config_json,
+          max_training_set = excluded.max_training_set,
+          updated_at = excluded.updated_at
+      `).run(options.name, configJson, options.maxTrainingSet, now, now);
+
+      database.prepare(`
+        INSERT OR IGNORE INTO generations (
+          classifier_name, generation, status, created_at
+        ) VALUES (?, 1, 'active', ?)
+      `).run(options.name, now);
+
+      trimExamples(
+        database,
+        options.name,
+        activeGeneration(database, options.name),
+        options.maxTrainingSet,
+      );
+    });
+  } catch (error) {
+    try {
+      artifactLockDatabase?.close();
+    } catch {
+      // Preserve the initialization error after attempting to close both handles.
+    }
+    try {
+      database.close();
+    } catch {
+      // Preserve the initialization error after attempting to close both handles.
+    }
+    throw error;
   }
 
-  transaction(database, () => {
-    database.prepare(`
-      INSERT INTO classifiers (
-        name, config_json, max_training_set, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(name) DO UPDATE SET
-        config_json = excluded.config_json,
-        max_training_set = excluded.max_training_set,
-        updated_at = excluded.updated_at
-    `).run(options.name, configJson, options.maxTrainingSet, now, now);
-
-    database.prepare(`
-      INSERT OR IGNORE INTO generations (
-        classifier_name, generation, status, created_at
-      ) VALUES (?, 1, 'active', ?)
-    `).run(options.name, now);
-
-    trimExamples(database, options.name, activeGeneration(database, options.name), options.maxTrainingSet);
-  });
+  const initializedArtifactLockDatabase = artifactLockDatabase;
 
   let closed = false;
+  let artifactLockHeld = false;
 
   const storage: Storage = {
     databasePath,
@@ -247,6 +373,13 @@ export function openStorage(options: OpenStorageOptions): Storage {
           g.trained,
           g.model_path,
           g.needle_version,
+          c.data_epoch,
+          c.clear_pending,
+          c.clear_erased,
+          c.clear_artifact_generation_max,
+          c.training_lease_owner,
+          c.training_lease_epoch,
+          c.training_lease_until,
           (
             SELECT COUNT(*)
             FROM examples e
@@ -276,24 +409,37 @@ export function openStorage(options: OpenStorageOptions): Storage {
         trained: row.trained === 1,
         modelPath: row.model_path,
         needleVersion: row.needle_version,
+        dataEpoch: row.data_epoch,
+        clearPending: row.clear_pending === 1,
+        clearErased: row.clear_erased === 1,
+        clearArtifactGenerationMax: row.clear_artifact_generation_max,
+        trainingLeaseOwner: row.training_lease_owner,
+        trainingLeaseEpoch: row.training_lease_epoch,
+        trainingLeaseUntil: row.training_lease_until,
       };
     },
 
-    addExample(input, result) {
+    addExample(input, result, expectedDataEpoch) {
       assertOpen(closed);
-      const generation = activeGeneration(database, options.name);
       const split = assignExampleSplit(options.name, input);
       const createdAt = Date.now();
       const resultJson = stringifyJson(result, "classification result");
       let id = 0;
+      let generation = 0;
+      let accepted = false;
 
       transaction(database, () => {
+        const state = classifierState(database, options.name);
+        const epoch = expectedDataEpoch ?? state.data_epoch;
+        if (state.data_epoch !== epoch || state.clear_pending === 1) return;
+        generation = state.active_generation;
         const insertion = database.prepare(`
           INSERT INTO examples (
             classifier_name, generation, input, result_json, split, created_at
           ) VALUES (?, ?, ?, ?, ?, ?)
         `).run(options.name, generation, input, resultJson, split, createdAt);
         id = Number(insertion.lastInsertRowid);
+        accepted = true;
 
         database.prepare(`
           UPDATE classifiers
@@ -306,7 +452,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
         trimExamples(database, options.name, generation, options.maxTrainingSet);
       });
 
-      return { id, generation, input, result, split, createdAt };
+      return accepted
+        ? { id, generation, input, result, split, createdAt }
+        : null;
     },
 
     listExamples(split, generation) {
@@ -329,47 +477,86 @@ export function openStorage(options: OpenStorageOptions): Storage {
       return rows.map((value) => mapExample(row<ExampleRow>(value)));
     },
 
-    markTrainingAttempted(exampleCount) {
+    listExamplesForTraining(split, generation, expectedDataEpoch) {
+      assertOpen(closed);
+      let examples: StoredExample[] | null = null;
+      transaction(database, () => {
+        const state = classifierState(database, options.name);
+        if (
+          state.data_epoch !== expectedDataEpoch ||
+          state.clear_pending === 1 ||
+          state.active_generation !== generation
+        ) {
+          return;
+        }
+        examples = database.prepare(`
+          SELECT id, generation, input, result_json, split, created_at
+          FROM examples
+          WHERE classifier_name = ? AND generation = ? AND split = ?
+          ORDER BY id
+        `).all(options.name, generation, split).map((value) =>
+          mapExample(row<ExampleRow>(value)),
+        );
+      });
+      return examples;
+    },
+
+    markTrainingAttempted(exampleCount, expectedDataEpoch) {
       assertOpen(closed);
       if (!Number.isSafeInteger(exampleCount) || exampleCount <= 0) {
         throw new TypeError("training example count must be a positive integer");
       }
-      database.prepare(`
+      const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
+      const result = database.prepare(`
         UPDATE classifiers
         SET new_examples_since_training = 0,
             training_attempts = training_attempts + 1,
             examples_used_for_training = ?,
             updated_at = ?
-        WHERE name = ?
-      `).run(exampleCount, Date.now(), options.name);
+        WHERE name = ? AND data_epoch = ? AND clear_pending = 0
+      `).run(exampleCount, Date.now(), options.name, epoch);
+      return result.changes === 1;
     },
 
-    promoteGeneration(model) {
+    promoteGeneration(model, expectedDataEpoch) {
       assertOpen(closed);
-      const generation = activeGeneration(database, options.name);
-      database.prepare(`
-        UPDATE generations
-        SET trained = 1, model_path = ?, needle_version = ?
-        WHERE classifier_name = ? AND generation = ?
-      `).run(model.modelPath, model.needleVersion, options.name, generation);
-      return generationByNumber(database, options.name, generation);
+      let generation = 0;
+      let promoted = false;
+      transaction(database, () => {
+        const state = classifierState(database, options.name);
+        const epoch = expectedDataEpoch ?? state.data_epoch;
+        if (state.data_epoch !== epoch || state.clear_pending === 1) return;
+        generation = state.active_generation;
+        database.prepare(`
+          UPDATE generations
+          SET trained = 1, model_path = ?, needle_version = ?
+          WHERE classifier_name = ? AND generation = ?
+        `).run(model.modelPath, model.needleVersion, options.name, generation);
+        promoted = true;
+      });
+      return promoted
+        ? generationByNumber(database, options.name, generation)
+        : null;
     },
 
-    recordLocalClassification() {
+    recordLocalClassification(expectedDataEpoch) {
       assertOpen(closed);
-      database.prepare(`
+      const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
+      const result = database.prepare(`
         UPDATE classifiers
         SET local_classifications_since_retest = local_classifications_since_retest + 1,
             total_local_classifications = total_local_classifications + 1,
             updated_at = ?
-        WHERE name = ?
-      `).run(Date.now(), options.name);
+        WHERE name = ? AND data_epoch = ? AND clear_pending = 0
+      `).run(Date.now(), options.name, epoch);
+      if (result.changes !== 1) return null;
       return storage.snapshot().localClassificationsSinceRetest;
     },
 
-    recordRetest(passed) {
+    recordRetest(passed, expectedDataEpoch) {
       assertOpen(closed);
-      database.prepare(`
+      const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
+      const result = database.prepare(`
         UPDATE classifiers
         SET local_classifications_since_retest = 0,
             total_retests = total_retests + 1,
@@ -378,29 +565,34 @@ export function openStorage(options: OpenStorageOptions): Storage {
               ELSE consecutive_retest_failures + 1
             END,
             updated_at = ?
-        WHERE name = ?
-      `).run(passed ? 1 : 0, Date.now(), options.name);
+        WHERE name = ? AND data_epoch = ? AND clear_pending = 0
+      `).run(passed ? 1 : 0, Date.now(), options.name, epoch);
+      if (result.changes !== 1) return null;
       return storage.snapshot().consecutiveRetestFailures;
     },
 
-    claimTrainingLease(owner, durationMs) {
+    claimTrainingLease(owner, durationMs, expectedDataEpoch) {
       assertOpen(closed);
       if (owner.trim() === "" || !Number.isSafeInteger(durationMs) || durationMs <= 0) {
         throw new TypeError("training lease needs an owner and positive duration");
       }
       const now = Date.now();
+      const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
       const result = database.prepare(`
         UPDATE classifiers
         SET training_lease_owner = ?,
             training_lease_until = ?,
+            training_lease_epoch = ?,
             updated_at = ?
         WHERE name = ?
+          AND data_epoch = ?
+          AND clear_pending = 0
           AND (
             training_lease_owner IS NULL
             OR training_lease_until <= ?
             OR training_lease_owner = ?
           )
-      `).run(owner, now + durationMs, now, options.name, now, owner);
+      `).run(owner, now + durationMs, epoch, now, options.name, epoch, now, owner);
       return result.changes === 1;
     },
 
@@ -410,18 +602,23 @@ export function openStorage(options: OpenStorageOptions): Storage {
         UPDATE classifiers
         SET training_lease_owner = NULL,
             training_lease_until = NULL,
+            training_lease_epoch = NULL,
             updated_at = ?
         WHERE name = ? AND training_lease_owner = ?
       `).run(Date.now(), options.name, owner);
     },
 
-    archiveAndReset() {
+    archiveAndReset(expectedDataEpoch) {
       assertOpen(closed);
       let nextGeneration = 0;
       const changedAt = Date.now();
+      let reset = false;
 
       transaction(database, () => {
-        const currentGeneration = activeGeneration(database, options.name);
+        const state = classifierState(database, options.name);
+        const epoch = expectedDataEpoch ?? state.data_epoch;
+        if (state.data_epoch !== epoch || state.clear_pending === 1) return;
+        const currentGeneration = state.active_generation;
         database.prepare(`
           UPDATE generations
           SET status = 'archived', archived_at = ?
@@ -444,19 +641,166 @@ export function openStorage(options: OpenStorageOptions): Storage {
         database.prepare(`
           UPDATE classifiers
           SET active_generation = ?,
+              data_epoch = data_epoch + 1,
               new_examples_since_training = 0,
               training_attempts = 0,
               examples_used_for_training = 0,
               training_lease_owner = NULL,
               training_lease_until = NULL,
+              training_lease_epoch = NULL,
               local_classifications_since_retest = 0,
               consecutive_retest_failures = 0,
               updated_at = ?
           WHERE name = ?
         `).run(nextGeneration, changedAt, options.name);
+        reset = true;
       });
 
+      return reset
+        ? generationByNumber(database, options.name, nextGeneration)
+        : null;
+    },
+
+    beginClearTrainingData() {
+      assertOpen(closed);
+      database.prepare(`
+        UPDATE classifiers
+        SET data_epoch = data_epoch + 1,
+            clear_pending = 1,
+            clear_erased = 0,
+            clear_artifact_generation_max = (
+              SELECT MAX(generation)
+              FROM generations
+              WHERE classifier_name = ?
+            ),
+            updated_at = ?
+        WHERE name = ?
+      `).run(options.name, Date.now(), options.name);
+      return classifierState(database, options.name).data_epoch;
+    },
+
+    eraseTrainingData(dataEpoch) {
+      assertOpen(closed);
+      let nextGeneration = 0;
+      const changedAt = Date.now();
+      let erased = false;
+
+      transaction(database, () => {
+        const state = classifierState(database, options.name);
+        if (state.data_epoch !== dataEpoch || state.clear_pending !== 1) return;
+        if (state.clear_erased === 1) return;
+        const maximum = requiredRow<{ maximum: number }>(database.prepare(`
+          SELECT MAX(generation) AS maximum
+          FROM generations
+          WHERE classifier_name = ?
+        `).get(options.name));
+        nextGeneration = maximum.maximum + 1;
+
+        database.prepare(`
+          DELETE FROM examples WHERE classifier_name = ?
+        `).run(options.name);
+        database.prepare(`
+          DELETE FROM generations WHERE classifier_name = ?
+        `).run(options.name);
+        database.prepare(`
+          INSERT INTO generations (
+            classifier_name, generation, status, created_at
+          ) VALUES (?, ?, 'active', ?)
+        `).run(options.name, nextGeneration, changedAt);
+        database.prepare(`
+          UPDATE classifiers
+          SET active_generation = ?,
+              total_examples_logged = 0,
+              new_examples_since_training = 0,
+              training_attempts = 0,
+              examples_used_for_training = 0,
+              local_classifications_since_retest = 0,
+              total_local_classifications = 0,
+              total_retests = 0,
+              consecutive_retest_failures = 0,
+              training_lease_owner = NULL,
+              training_lease_until = NULL,
+              training_lease_epoch = NULL,
+              clear_erased = 1,
+              updated_at = ?
+          WHERE name = ?
+        `).run(nextGeneration, changedAt, options.name);
+        erased = true;
+      });
+
+      if (!erased) return null;
+
+      truncateWriteAheadLog(database);
+
       return generationByNumber(database, options.name, nextGeneration);
+    },
+
+    finishClearTrainingData(dataEpoch) {
+      assertOpen(closed);
+      const state = classifierState(database, options.name);
+      if (
+        state.data_epoch !== dataEpoch ||
+        state.clear_pending !== 1 ||
+        state.clear_erased !== 1
+      ) {
+        return false;
+      }
+      truncateWriteAheadLog(database);
+      const result = database.prepare(`
+        UPDATE classifiers
+        SET clear_pending = 0, updated_at = ?
+        WHERE name = ?
+          AND data_epoch = ?
+          AND clear_pending = 1
+          AND clear_erased = 1
+      `).run(Date.now(), options.name, dataEpoch);
+      return result.changes === 1;
+    },
+
+    clearTrainingData() {
+      const dataEpoch = storage.beginClearTrainingData();
+      if (!storage.claimArtifactWriteLock()) {
+        throw new Error("Classifier artifacts are currently being written");
+      }
+      try {
+        const generation = storage.eraseTrainingData(dataEpoch);
+        if (generation === null || !storage.finishClearTrainingData(dataEpoch)) {
+          throw new Error("Training data clear was superseded");
+        }
+        return generation;
+      } finally {
+        storage.releaseArtifactWriteLock();
+      }
+    },
+
+    claimArtifactWriteLock() {
+      assertOpen(closed);
+      if (artifactLockHeld) return true;
+      try {
+        initializedArtifactLockDatabase.exec("BEGIN IMMEDIATE");
+        artifactLockHeld = true;
+        return true;
+      } catch (error) {
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "ERR_SQLITE_ERROR" &&
+          "message" in error &&
+          typeof error.message === "string" &&
+          /locked|busy/i.test(error.message)
+        ) {
+          return false;
+        }
+        throw error;
+      }
+    },
+
+    releaseArtifactWriteLock() {
+      assertOpen(closed);
+      if (!artifactLockHeld) return;
+      initializedArtifactLockDatabase.exec("COMMIT");
+      artifactLockHeld = false;
     },
 
     listGenerations() {
@@ -475,6 +819,11 @@ export function openStorage(options: OpenStorageOptions): Storage {
       if (closed) {
         return;
       }
+      if (artifactLockHeld) {
+        initializedArtifactLockDatabase.exec("ROLLBACK");
+        artifactLockHeld = false;
+      }
+      initializedArtifactLockDatabase.close();
       closed = true;
       database.close();
     },
@@ -488,6 +837,88 @@ function activeGeneration(database: DatabaseSyncType, name: string): number {
     SELECT active_generation FROM classifiers WHERE name = ?
   `).get(name));
   return active.active_generation;
+}
+
+function truncateWriteAheadLog(database: DatabaseSyncType): void {
+  database.exec("PRAGMA busy_timeout = 0");
+  let checkpoint: { busy: number; log: number; checkpointed: number };
+  try {
+    checkpoint = requiredRow<{
+      busy: number;
+      log: number;
+      checkpointed: number;
+    }>(database.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get());
+  } finally {
+    database.exec("PRAGMA busy_timeout = 5000");
+  }
+  if (checkpoint.busy !== 0) {
+    throw new Error(
+      "SQLite WAL could not be truncated after clearing training data",
+    );
+  }
+}
+
+function classifierState(
+  database: DatabaseSyncType,
+  name: string,
+): {
+  active_generation: number;
+  data_epoch: number;
+  clear_pending: number;
+  clear_erased: number;
+  clear_artifact_generation_max: number | null;
+  training_lease_owner: string | null;
+  training_lease_epoch: number | null;
+  training_lease_until: number | null;
+} {
+  return requiredRow(database.prepare(`
+    SELECT
+      active_generation,
+      data_epoch,
+      clear_pending,
+      clear_erased,
+      clear_artifact_generation_max,
+      training_lease_owner,
+      training_lease_epoch,
+      training_lease_until
+    FROM classifiers
+    WHERE name = ?
+  `).get(name));
+}
+
+function migrateClassifierColumns(database: DatabaseSyncType): void {
+  transaction(database, () => {
+    const columns = new Set(
+      database.prepare("PRAGMA table_info(classifiers)").all().map((value) =>
+        row<{ name: string }>(value).name,
+      ),
+    );
+    if (!columns.has("data_epoch")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN data_epoch INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!columns.has("clear_pending")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN clear_pending INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!columns.has("clear_erased")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN clear_erased INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!columns.has("clear_artifact_generation_max")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN clear_artifact_generation_max INTEGER",
+      );
+    }
+    if (!columns.has("training_lease_epoch")) {
+      database.exec(
+        "ALTER TABLE classifiers ADD COLUMN training_lease_epoch INTEGER",
+      );
+    }
+  });
 }
 
 function generationByNumber(

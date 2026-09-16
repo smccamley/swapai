@@ -6,11 +6,12 @@ import {
   mkdir,
   readFile,
   readdir,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SwapAIError } from "./errors.js";
@@ -31,6 +32,7 @@ export interface CommandOptions {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly timeoutMs?: number;
+  readonly stdin?: string;
 }
 
 export type RunCommand = (
@@ -71,6 +73,7 @@ export interface CreateNeedleRuntimeOptions {
 export interface TrainNeedleModelOptions {
   readonly classifierName: string;
   readonly generation: number;
+  readonly expectedEpoch: number;
   readonly examples: readonly NeedleExample[];
   readonly resultConfig: NeedleResultConfig;
   readonly epochs?: number;
@@ -95,6 +98,15 @@ export interface NeedleRuntime {
   ready(): Promise<void>;
   train(options: TrainNeedleModelOptions): Promise<TrainedNeedleModel>;
   loadModel(options: LoadNeedleModelOptions): Promise<LoadedNeedleModel>;
+  clearClassifierArtifacts(classifierName: string): Promise<void>;
+  clearClassifierGenerationArtifacts(
+    classifierName: string,
+    generation: number,
+  ): Promise<void>;
+  clearClassifierArtifactsThroughGeneration(
+    classifierName: string,
+    maximumGeneration: number,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -133,8 +145,8 @@ class ManagedNeedleRuntime implements NeedleRuntime {
   #closed = false;
 
   constructor(options: CreateNeedleRuntimeOptions) {
-    this.#dataDirectory = options.dataDirectory;
-    this.#runtimeDirectory = join(options.dataDirectory, "runtime");
+    this.#dataDirectory = resolve(options.dataDirectory);
+    this.#runtimeDirectory = join(this.#dataDirectory, "runtime");
     this.#runCommand = options.dependencies?.runCommand ?? runCommand;
     this.#spawnProcess = options.dependencies?.spawnProcess ?? spawnProcess;
     this.#fetch = options.dependencies?.fetch ?? globalThis.fetch;
@@ -165,6 +177,12 @@ class ManagedNeedleRuntime implements NeedleRuntime {
       throw new NeedleRuntimeError(
         "service_unavailable",
         "Needle generation must be a non-negative integer.",
+      );
+    }
+    if (!Number.isSafeInteger(options.expectedEpoch) || options.expectedEpoch < 0) {
+      throw new NeedleRuntimeError(
+        "service_unavailable",
+        "Needle data epoch must be a non-negative integer.",
       );
     }
     if (options.examples.length === 0) {
@@ -198,7 +216,11 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     const lines = options.examples.map((example) =>
       createTrainingLine(example.input, example.result, options.resultConfig),
     );
-    await writeFile(trainingPath, `${lines.join("\n")}\n`, "utf8");
+    const lockPath = join(
+      this.#dataDirectory,
+      "locks",
+      `${createHash("sha256").update(options.classifierName).digest("hex")}.sqlite`,
+    );
 
     try {
       await this.#runCommand(
@@ -214,11 +236,20 @@ class ManagedNeedleRuntime implements NeedleRuntime {
           checkpointDirectory,
           "--epochs",
           String(options.epochs ?? 10),
+          "--artifact-lock-database",
+          lockPath,
+          "--main-database",
+          join(this.#dataDirectory, "swapai.sqlite"),
+          "--classifier-name",
+          options.classifierName,
+          "--expected-epoch",
+          String(options.expectedEpoch),
         ],
         {
           cwd: candidateDirectory,
           env: this.#environment!,
           timeoutMs: 6 * 60 * 60 * 1000,
+          stdin: `${lines.join("\n")}\n`,
         },
       );
       await stat(modelPath);
@@ -272,6 +303,84 @@ class ManagedNeedleRuntime implements NeedleRuntime {
       process.kill("SIGTERM");
       throw toRuntimeError("Needle model could not start.", error);
     }
+  }
+
+  async clearClassifierArtifacts(classifierName: string): Promise<void> {
+    await rm(
+      join(this.#dataDirectory, "classifiers", classifierKey(classifierName)),
+      { recursive: true, force: true },
+    );
+  }
+
+  async clearClassifierGenerationArtifacts(
+    classifierName: string,
+    generation: number,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new NeedleRuntimeError(
+        "service_unavailable",
+        "Classifier generation must be a non-negative safe integer.",
+      );
+    }
+    const classifierDirectory = resolve(
+      this.#dataDirectory,
+      "classifiers",
+      classifierKey(classifierName),
+    );
+    const generationDirectory = resolve(
+      classifierDirectory,
+      `generation-${generation}`,
+    );
+    if (!generationDirectory.startsWith(`${classifierDirectory}${sep}`)) {
+      throw new NeedleRuntimeError(
+        "service_unavailable",
+        "Classifier generation path is outside its classifier directory.",
+      );
+    }
+    await rm(generationDirectory, { recursive: true, force: true });
+  }
+
+  async clearClassifierArtifactsThroughGeneration(
+    classifierName: string,
+    maximumGeneration: number,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(maximumGeneration) || maximumGeneration < 0) {
+      throw new NeedleRuntimeError(
+        "service_unavailable",
+        "Maximum classifier generation must be a non-negative safe integer.",
+      );
+    }
+    const classifierDirectory = join(
+      this.#dataDirectory,
+      "classifiers",
+      classifierKey(classifierName),
+    );
+    let entries;
+    try {
+      entries = await readdir(classifierDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return;
+      }
+      throw error;
+    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const match = /^generation-(\d+)$/.exec(entry.name);
+        if (!entry.isDirectory() || match === null) return;
+        const generation = Number(match[1]);
+        if (generation > maximumGeneration) return;
+        await rm(join(classifierDirectory, entry.name), {
+          recursive: true,
+          force: true,
+        });
+      }),
+    );
   }
 
   async close(): Promise<void> {
@@ -555,10 +664,7 @@ class NeedleModelProcess implements LoadedNeedleModel {
         await withTimeout(this.#exitPromise, 2_000, "Needle ignored SIGTERM.");
       } catch {
         this.#process.kill("SIGKILL");
-        await Promise.race([
-          this.#exitPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-        ]);
+        await withTimeout(this.#exitPromise, 2_000, "Needle ignored SIGKILL.");
       }
     }
   }
@@ -684,8 +790,12 @@ const runCommand: RunCommand = (command, args, options) =>
     const child = spawn(command, [...args], {
       cwd: options?.cwd,
       env: options?.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options?.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
+    if (options?.stdin !== undefined && child.stdin !== null) {
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(options.stdin, "utf8");
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -715,10 +825,10 @@ const runCommand: RunCommand = (command, args, options) =>
       if (forceKill !== undefined) clearTimeout(forceKill);
       if (rejectAfterKill !== undefined) clearTimeout(rejectAfterKill);
     };
-    child.stdout.on("data", (chunk: Buffer | string) => {
+    child.stdout!.on("data", (chunk: Buffer | string) => {
       stdout = `${stdout}${chunk.toString()}`.slice(-262_144);
     });
-    child.stderr.on("data", (chunk: Buffer | string) => {
+    child.stderr!.on("data", (chunk: Buffer | string) => {
       stderr = `${stderr}${chunk.toString()}`.slice(-262_144);
     });
     child.once("error", (error) => {
