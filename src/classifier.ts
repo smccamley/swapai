@@ -68,6 +68,22 @@ function openClassifierStorage<const Config extends ResultConfig>(
           ? {}
           : { datasetPolicy: config.datasetPolicy }),
       },
+      ...(config.datasetPolicy === undefined
+        ? {}
+        : {
+            prepareLegacyExampleMetadata: (
+              input: string,
+              result: ResultValue,
+            ) =>
+              prepareExampleMetadata(
+                config.name,
+                config.result,
+                config.acceptableError,
+                config.datasetPolicy!,
+                input,
+                result as ResultFor<Config>,
+              ),
+          }),
     });
   } catch (error) {
     throw new SwapAIError(
@@ -103,7 +119,11 @@ function createClassifier<const Config extends ResultConfig>(
     } catch (error) {
       reportBackgroundError(
         config,
-        toSwapAIError(error, "storage_failed", "Could not update classifier status"),
+        toSwapAIError(
+          error,
+          "storage_failed",
+          "Could not update classifier status",
+        ),
       );
     }
   }, RUNTIME_HEARTBEAT_MS);
@@ -128,7 +148,8 @@ function createClassifier<const Config extends ResultConfig>(
       }))
   ) {
     if (
-      storage.archiveAndReset(saved.dataEpoch, { retainExamples: true }) !== null
+      storage.archiveAndReset(saved.dataEpoch, { retainExamples: true }) !==
+      null
     ) {
       const reset = storage.snapshot();
       dataEpoch = reset.dataEpoch;
@@ -159,11 +180,9 @@ function createClassifier<const Config extends ResultConfig>(
     try {
       await runtime.ready();
     } catch (error) {
-      rememberBackgroundFailure(toSwapAIError(
-        error,
-        "service_unavailable",
-        "Needle could not start",
-      ));
+      rememberBackgroundFailure(
+        toSwapAIError(error, "service_unavailable", "Needle could not start"),
+      );
       return;
     }
     const snapshot = storage.snapshot();
@@ -264,17 +283,18 @@ function createClassifier<const Config extends ResultConfig>(
     if (epoch !== dataEpoch) return Promise.resolve();
     return enqueue(() => {
       if (epoch !== dataEpoch) return;
-      const metadata = config.datasetPolicy === undefined
-        ? undefined
-        : prepareExampleMetadata(
-            config.name,
-            config.result,
-            config.acceptableError,
-            config.datasetPolicy,
-            input,
-            result,
-            facets,
-          );
+      const metadata =
+        config.datasetPolicy === undefined
+          ? undefined
+          : prepareExampleMetadata(
+              config.name,
+              config.result,
+              config.acceptableError,
+              config.datasetPolicy,
+              input,
+              result,
+              facets,
+            );
       if (storage.addExample(input, result, epoch, metadata) !== null) {
         scheduleTraining();
       }
@@ -325,29 +345,29 @@ function createClassifier<const Config extends ResultConfig>(
       return false;
     }
 
-      let leaseHeld = true;
-      const renewTrainingLease = (): boolean => {
-        if (!leaseHeld) return false;
-        try {
-          leaseHeld = storage.claimTrainingLease(
-            trainingLeaseOwner,
-            TRAINING_LEASE_DURATION_MS,
-            trainingEpoch,
-          );
-        } catch {
-          leaseHeld = false;
-        }
-        return leaseHeld;
-      };
-      const leaseRenewal = setInterval(
-        renewTrainingLease,
-        TRAINING_LEASE_RENEWAL_MS,
-      );
-      leaseRenewal.unref();
-
+    let leaseHeld = true;
+    const renewTrainingLease = (): boolean => {
+      if (!leaseHeld) return false;
       try {
-        const snapshot = storage.snapshot();
-        if (!shouldTrain(snapshot)) return false;
+        leaseHeld = storage.claimTrainingLease(
+          trainingLeaseOwner,
+          TRAINING_LEASE_DURATION_MS,
+          trainingEpoch,
+        );
+      } catch {
+        leaseHeld = false;
+      }
+      return leaseHeld;
+    };
+    const leaseRenewal = setInterval(
+      renewTrainingLease,
+      TRAINING_LEASE_RENEWAL_MS,
+    );
+    leaseRenewal.unref();
+
+    try {
+      const snapshot = storage.snapshot();
+      if (!shouldTrain(snapshot)) return false;
 
       if (
         !storage.markTrainingAttempted(
@@ -377,7 +397,10 @@ function createClassifier<const Config extends ResultConfig>(
         classifierName: config.name,
         generation: snapshot.activeGeneration,
         expectedEpoch: trainingEpoch,
-        examples: trainingExamples.map(({ input, result }) => ({ input, result })),
+        examples: trainingExamples.map(({ input, result }) => ({
+          input,
+          result,
+        })),
         resultConfig: config.result,
         acceptableError: config.acceptableError,
       });
@@ -424,10 +447,7 @@ function createClassifier<const Config extends ResultConfig>(
 
         if (!renewTrainingLease()) {
           const current = refreshStoredState();
-          if (
-            current.dataEpoch !== trainingEpoch ||
-            current.clearPending
-          ) {
+          if (current.dataEpoch !== trainingEpoch || current.clearPending) {
             await runtime.clearClassifierGenerationArtifacts(
               config.name,
               snapshot.activeGeneration,
@@ -469,10 +489,10 @@ function createClassifier<const Config extends ResultConfig>(
       } finally {
         if (loadedModel !== candidateModel) await candidateModel.close();
       }
-      } finally {
-        clearInterval(leaseRenewal);
-        storage.releaseTrainingLease(trainingLeaseOwner);
-      }
+    } finally {
+      clearInterval(leaseRenewal);
+      storage.releaseTrainingLease(trainingLeaseOwner);
+    }
   }
 
   async function model(expectedEpoch: number): Promise<LoadedNeedleModel> {
@@ -510,7 +530,8 @@ function createClassifier<const Config extends ResultConfig>(
       } catch (error) {
         if (
           error instanceof NeedleModelArtifactError &&
-          storage.archiveAndReset(expectedEpoch, { retainExamples: true }) !== null
+          storage.archiveAndReset(expectedEpoch, { retainExamples: true }) !==
+            null
         ) {
           const reset = refreshStoredState();
           dataEpoch = reset.dataEpoch;
@@ -571,7 +592,8 @@ function createClassifier<const Config extends ResultConfig>(
     const referenceResult = await callReference(input, reference);
     await persistExample(input, referenceResult, epoch, facets);
     if (retestDue && epoch === dataEpoch) {
-      if (storage.recordLocalClassification(epoch) === null) return referenceResult;
+      if (storage.recordLocalClassification(epoch) === null)
+        return referenceResult;
       const failures = storage.recordRetest(false, epoch);
       if (failures !== null && failures >= config.retestRevertOn) {
         await disableModel(epoch);
@@ -673,17 +695,14 @@ function createClassifier<const Config extends ResultConfig>(
     const referenceResult = await callReference(input, reference);
     await persistExample(input, referenceResult, epoch, facets);
     if (epoch !== dataEpoch) return referenceResult;
-    if (storage.recordLocalClassification(epoch) === null) return referenceResult;
+    if (storage.recordLocalClassification(epoch) === null)
+      return referenceResult;
     const passed =
       resultError(config.result, referenceResult, candidateResult) <=
       config.acceptableError;
     const failures = storage.recordRetest(passed, epoch);
 
-    if (
-      !passed &&
-      failures !== null &&
-      failures >= config.retestRevertOn
-    ) {
+    if (!passed && failures !== null && failures >= config.retestRevertOn) {
       await disableModel(epoch);
     }
 
@@ -790,10 +809,7 @@ function createClassifier<const Config extends ResultConfig>(
       await training;
       if (operations === operationQueue && training === trainingQueue) break;
     }
-    if (
-      clearFailure !== null &&
-      clearFailure !== clearFailureBeforeFlush
-    ) {
+    if (clearFailure !== null && clearFailure !== clearFailureBeforeFlush) {
       throw clearFailure;
     }
     const pending = refreshStoredState();
@@ -847,10 +863,8 @@ function createClassifier<const Config extends ResultConfig>(
       void enqueue(async () => {
         const clearFailureBeforeStartup = clearFailure;
         await ensureRuntimeStarted();
-        if (
-          clearFailure !== null &&
-          clearFailure !== clearFailureBeforeStartup
-        ) return;
+        if (clearFailure !== null && clearFailure !== clearFailureBeforeStartup)
+          return;
         await trainingBeforeClear;
         await classificationsBeforeClear;
         try {

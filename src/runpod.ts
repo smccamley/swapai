@@ -13,7 +13,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://rest.runpod.io/v1";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.4.0";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.4.2";
 const DEFAULT_GPU_TYPES = [
   "NVIDIA A40",
   "NVIDIA RTX A5000",

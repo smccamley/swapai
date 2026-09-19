@@ -92,7 +92,7 @@ ceiling. Pod names contain their hard deadline; later runs remove expired
 SwapAI Pods before allocating another. SwapAI never keeps a Pod intentionally.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.4.0`. The image is built from
+`ghcr.io/smccamley/swapai-trainer:0.4.2`. The image is built from
 [`trainer/Dockerfile`](trainer/Dockerfile) and pins `cactus-needle` 2.0.14 with
 its NVIDIA/JAX training dependencies.
 

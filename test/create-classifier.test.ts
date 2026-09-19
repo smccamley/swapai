@@ -36,6 +36,10 @@ describe("createClassifier", () => {
       automaticTraining: false,
       dataDirectory,
     });
+    legacy.logClassification("historic relevant invoice", 0.92);
+    legacy.logClassification("historic irrelevant newsletter", 0.08);
+    legacy.logClassification("historic boundary high", 0.51);
+    legacy.logClassification("historic boundary low", 0.49);
     await legacy.close();
 
     const relevance = createClassifier({
@@ -45,6 +49,17 @@ describe("createClassifier", () => {
       decisionBoundaries: [0.5],
       dataDirectory,
     });
+
+    const inspection = relevance.inspect();
+    expect(
+      inspection.examplesByPurpose.training +
+        inspection.examplesByPurpose.validation,
+    ).toBe(4);
+    expect(inspection.examplesByPurpose.representative_test).toBe(0);
+    expect(inspection.examplesByPurpose.coverage_test).toBe(0);
+    expect(
+      inspection.resultBins.reduce((total, bin) => total + bin.total, 0),
+    ).toBe(4);
 
     await expect(relevance.close()).resolves.toBeUndefined();
   });
@@ -92,7 +107,7 @@ describe("createClassifier", () => {
     const relevance = createClassifier({
       name: "accountant-relevance",
       result: { type: "number", min: 0, max: 1 },
-      reference: async (input) => input.startsWith("relevant") ? 0.92 : 0.08,
+      reference: async (input) => (input.startsWith("relevant") ? 0.92 : 0.08),
       decisionBoundaries: [0.5],
       facets: ["documentFamily"] as const,
       dataDirectory: makeDirectory(),
@@ -174,9 +189,9 @@ describe("createClassifier", () => {
 
     const inspection = relevance.inspect();
     expect(inspection.retainedExamples).toBe(8);
-    expect(
-      inspection.resultBins.find((bin) => bin.id === "true")?.total,
-    ).toBe(1);
+    expect(inspection.resultBins.find((bin) => bin.id === "true")?.total).toBe(
+      1,
+    );
     await relevance.close();
   });
 
@@ -244,8 +259,16 @@ describe("createClassifier", () => {
           example.purpose === "training" || example.purpose === "validation",
       ),
     ).toBe(true);
-    expect(receivedJobs[0]!.examples.some((example) => example.purpose === "training")).toBe(true);
-    expect(receivedJobs[0]!.examples.some((example) => example.purpose === "validation")).toBe(true);
+    expect(
+      receivedJobs[0]!.examples.some(
+        (example) => example.purpose === "training",
+      ),
+    ).toBe(true);
+    expect(
+      receivedJobs[0]!.examples.some(
+        (example) => example.purpose === "validation",
+      ),
+    ).toBe(true);
     expect(relevance.inspect().latestTrainingRun).toMatchObject({
       id: receivedJobs[0]!.id,
       provider: "recording-trainer",
