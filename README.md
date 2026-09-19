@@ -97,12 +97,59 @@ coverage, declared-facet groups (including unlabelled examples), readiness
 deficits, the newest 100 training runs, provider resources, cleanup state,
 protected metrics, cost, artifacts, and shadow evidence.
 
-On the first 0.6 configured open of never-trained legacy data, SwapAI repairs
+On the first configured open of never-attempted legacy data, SwapAI repairs
 the earlier 0.5 two-purpose adoption and assigns all four purposes
 deterministically so existing observations can satisfy modern readiness. If
 any local attempt, provider run, model artifact, or earlier generation exists,
 legacy trainer-visible rows stay non-protected and cannot become validation or
 test evidence.
+
+### Explicit legacy held-out migration
+
+SwapAI 0.5 counted a local attempt before Needle produced a candidate. For an
+attempted legacy classifier, first stop every process using the classifier and
+inspect a one-time migration plan. Targets are explicit; SwapAI does not invent
+a statistically meaningful split:
+
+```ts
+import {
+  inspectLegacyHeldOutMigration,
+  migrateLegacyHeldOutExamples,
+} from "@swapai/core";
+
+const options = {
+  dataDirectory: ".swapai",
+  classifierName: "accountant-relevance",
+  targetExamplesByPurpose: {
+    validation: 135,
+    representative_test: 100,
+    coverage_test: 35,
+  },
+} as const;
+
+const plan = inspectLegacyHeldOutMigration(options);
+if (plan.status !== "ready") throw new Error(JSON.stringify(plan.blockers));
+
+const migration = migrateLegacyHeldOutExamples({
+  ...options,
+  expectedPlanSha256: plan.planSha256,
+  attestation: {
+    heldOutExamplesWereNeverUsedForModelSelection: true,
+    operator: "deployment-owner",
+    reason: "Verified no candidate model or evaluation was produced",
+  },
+});
+```
+
+The command holds an exclusive database transaction, rechecks the reviewed
+plan hash, preserves every original `training` row, and changes only original
+`held_out` rows. It blocks active runtimes, completed evaluations, provider
+runs, trained or previous generations, indexed artifacts, and candidate model,
+LoRA, or sidecar files. A failed attempt's `training.jsonl` and shared base
+checkpoint do not prove held-out evaluation. The plan validates configured
+minimums and allocates deterministically across result-bin and facet groups.
+The operator, reason, targets, counts, and plan digest are stored durably;
+repeating the command returns `already_migrated`.
 
 When `maxTrainingSet` is reached, retention balances result bin, purpose, and
 facet groups rather than keeping only recent majority traffic.
@@ -121,7 +168,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.0`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.1`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 

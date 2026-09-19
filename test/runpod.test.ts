@@ -229,7 +229,7 @@ describe("runpodTrainer", () => {
           method: "POST",
           url: "https://api.runpod.io/v2/pods",
           body: expect.objectContaining({
-            image: "ghcr.io/smccamley/swapai-trainer:0.6.0",
+            image: "ghcr.io/smccamley/swapai-trainer:0.6.1",
             gpu: expect.objectContaining({
               id: "NVIDIA RTX A5000",
               count: 1,
