@@ -17,6 +17,7 @@ import type {
 
 const RUNPOD_API = "https://api.runpod.io/v2";
 const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.5.0";
+const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const DEFAULT_GPU_TYPES = [
   "NVIDIA A40",
   "NVIDIA RTX A5000",
@@ -82,8 +83,8 @@ export const runpodTrainer = (
         ["-y", "-f", privateKey],
       )).stdout.trim();
       if (publicKey === "") throw new Error("SSH public key is empty");
-      const deadline = now() + runtimeMinutes * 60_000;
       const billingStartedAt = now();
+      const deadline = billingStartedAt + runtimeMinutes * 60_000;
       const pod = await createPodForFirstAvailableGpu(
         api,
         options.gpuTypes ?? DEFAULT_GPU_TYPES,
@@ -103,21 +104,29 @@ export const runpodTrainer = (
           providerRunId: pod.id,
           resources: [{ type: "runpod-pod", id: pod.id }],
         });
+        const trainingWindowMs = paidTrainingWindowMilliseconds({
+          hourlyCost: pod.cost,
+          maximumCostUsd: options.maximumCostUsd,
+          maximumRuntimeMinutes: runtimeMinutes,
+          billingStartedAt,
+          currentTime: now(),
+        });
+        if (trainingWindowMs <= 0) {
+          throw new Error(
+            "Runpod Pod leaves no positive training window after cleanup headroom",
+          );
+        }
         result = await withTimeout(
           usePod({
             api,
             job,
             pod,
             privateKey,
-            maximumCostUsd: options.maximumCostUsd,
-            maximumRuntimeMinutes: runtimeMinutes,
             runCommand,
             sleep,
-            now,
-            startedAt: billingStartedAt,
           }),
-          runtimeMinutes * 60_000,
-          `Runpod training exceeded ${runtimeMinutes} minutes`,
+          trainingWindowMs,
+          "Runpod paid training window expired",
         );
       } catch (error) {
         trainingError = error;
@@ -136,7 +145,10 @@ export const runpodTrainer = (
       }
       if (trainingError !== undefined) throw trainingError;
       if (cleanupError !== undefined) throw cleanupError;
-      return result!;
+      return {
+        ...result!,
+        costUsd: pod.cost! * Math.max(0, now() - billingStartedAt) / 3_600_000,
+      };
     },
     cancel: async (run, lifecycle) => {
       if (run.providerRunId === null) {
@@ -145,21 +157,88 @@ export const runpodTrainer = (
       await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
     },
     reconcile: async (run, lifecycle) => {
-      if (run.providerRunId === null) {
+      let providerRunId = run.providerRunId;
+      if (providerRunId === null) {
+        const managedPods = (await api.listPods()).filter((pod) =>
+          pod.name.endsWith(`-${run.id}`) && pod.name.startsWith("swapai-")
+        );
+        if (managedPods.length === 0) {
+          if (now() < run.startedAt + runtimeMinutes * 60_000) {
+            return { status: "running" };
+          }
+          lifecycle?.recordCleanup({ status: "succeeded" });
+          return {
+            status: "failed",
+            failureMessage: "Runpod Pod ID was never recorded and no managed Pod exists",
+          };
+        }
+        if (managedPods.length > 1) {
+          const failures: unknown[] = [];
+          try {
+            lifecycle?.recordProviderRun({
+              providerRunId: managedPods[0]!.id,
+              resources: managedPods.map((pod) => ({
+                type: "runpod-pod",
+                id: pod.id,
+              })),
+            });
+          } catch (error) {
+            failures.push(error);
+          }
+          for (const pod of managedPods) {
+            try {
+              await deletePodAndReport(api, pod.id, sleep, lifecycle);
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+          if (failures.length === 1) throw failures[0];
+          if (failures.length > 1) {
+            throw new AggregateError(
+              failures,
+              `Could not safely clean ambiguous Runpod Pods for ${run.id}`,
+            );
+          }
+          return {
+            status: "failed",
+            failureMessage: "Multiple managed Runpod Pods matched this training run",
+          };
+        }
+        const managedPod = managedPods[0]!;
+        providerRunId = managedPod.id;
+        try {
+          lifecycle?.recordProviderRun({
+            providerRunId,
+            resources: [{ type: "runpod-pod", id: providerRunId }],
+          });
+        } catch (error) {
+          try {
+            await deletePodAndReport(api, providerRunId, sleep, lifecycle);
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [error, cleanupError],
+              `Could not persist or clean recovered Runpod Pod ${providerRunId}`,
+            );
+          }
+          throw error;
+        }
+      }
+      if (run.status !== "running") {
+        await deletePodAndReport(api, providerRunId, sleep, lifecycle);
         return {
           status: "failed",
-          failureMessage: "Running training record has no Runpod Pod ID",
+          failureMessage: "Cleaned provider resource for terminal training run",
         };
       }
       if (now() >= run.startedAt + runtimeMinutes * 60_000) {
-        await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
+        await deletePodAndReport(api, providerRunId, sleep, lifecycle);
         return {
           status: "failed",
           failureMessage: `Runpod training exceeded ${runtimeMinutes} minutes`,
         };
       }
       try {
-        const pod = await api.getPod(run.providerRunId);
+        const pod = await api.getPod(providerRunId);
         if (pod.status === "TERMINATED") {
           lifecycle?.recordCleanup({ status: "succeeded" });
           return {
@@ -168,10 +247,33 @@ export const runpodTrainer = (
           };
         }
         if (pod.status === "EXITED" || pod.status === "ERROR") {
-          await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
+          await deletePodAndReport(api, providerRunId, sleep, lifecycle);
           return {
             status: "failed",
             failureMessage: `Runpod Pod ended with status ${pod.status}`,
+          };
+        }
+        let paidWindowMs: number;
+        try {
+          paidWindowMs = paidTrainingWindowMilliseconds({
+            hourlyCost: pod.cost,
+            maximumCostUsd: options.maximumCostUsd,
+            maximumRuntimeMinutes: runtimeMinutes,
+            billingStartedAt: run.startedAt,
+            currentTime: now(),
+          });
+        } catch (error) {
+          await deletePodAndReport(api, providerRunId, sleep, lifecycle);
+          return {
+            status: "failed",
+            failureMessage: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (paidWindowMs <= 0) {
+          await deletePodAndReport(api, providerRunId, sleep, lifecycle);
+          return {
+            status: "failed",
+            failureMessage: "Runpod paid training window expired",
           };
         }
         return { status: "running" };
@@ -194,22 +296,12 @@ const usePod = async (options: {
   readonly job: TrainingJob;
   readonly pod: RunpodPod;
   readonly privateKey: string;
-  readonly maximumCostUsd: number;
-  readonly maximumRuntimeMinutes: number;
   readonly runCommand: NonNullable<RunpodTrainerDependencies["runCommand"]>;
   readonly sleep: NonNullable<RunpodTrainerDependencies["sleep"]>;
-  readonly now: () => number;
-  readonly startedAt: number;
 }): Promise<TrainingCandidate> => {
   const hourlyCost = options.pod.cost;
   if (hourlyCost === undefined || !Number.isFinite(hourlyCost)) {
     throw new Error("Runpod did not report the Pod hourly cost");
-  }
-  const maximumRunCost = hourlyCost * options.maximumRuntimeMinutes / 60;
-  if (maximumRunCost > options.maximumCostUsd) {
-    throw new Error(
-      `Runpod Pod could cost $${maximumRunCost.toFixed(2)}; limit is $${options.maximumCostUsd.toFixed(2)}`,
-    );
   }
 
   const connected = await waitForConnectablePod(
@@ -264,8 +356,31 @@ const usePod = async (options: {
   return {
     ...verified,
     providerRunId: options.pod.id,
-    costUsd: hourlyCost * Math.max(0, options.now() - options.startedAt) / 3_600_000,
   };
+};
+
+const paidTrainingWindowMilliseconds = (options: {
+  readonly hourlyCost: number | undefined;
+  readonly maximumCostUsd: number;
+  readonly maximumRuntimeMinutes: number;
+  readonly billingStartedAt: number;
+  readonly currentTime: number;
+}): number => {
+  if (options.hourlyCost === undefined || !Number.isFinite(options.hourlyCost)) {
+    throw new Error("Runpod did not report the Pod hourly cost");
+  }
+  if (options.hourlyCost <= 0) {
+    throw new Error("Runpod reported a non-positive Pod hourly cost");
+  }
+  const runtimeDeadline =
+    options.billingStartedAt + options.maximumRuntimeMinutes * 60_000;
+  const costDeadline = options.billingStartedAt +
+    options.maximumCostUsd / options.hourlyCost * 3_600_000;
+  return Math.floor(
+    Math.min(runtimeDeadline, costDeadline) -
+      CLEANUP_HEADROOM_MS -
+      options.currentTime,
+  );
 };
 
 const createRunpodApi = (
@@ -327,7 +442,11 @@ const createPodForFirstAvailableGpu = async (
       });
     } catch (error) {
       lastError = error;
-      if (!hasStatus(error, 400) && !hasStatus(error, 404)) throw error;
+      if (
+        !hasStatus(error, 400) &&
+        !hasStatus(error, 404) &&
+        !hasStatus(error, 422)
+      ) throw error;
     }
   }
   throw lastError ?? new Error("Runpod has no configured GPU type");
@@ -524,8 +643,15 @@ const validateOptions = (options: RunpodTrainerOptions): void => {
   }
   if (
     options.maximumRuntimeMinutes !== undefined &&
-    (!Number.isFinite(options.maximumRuntimeMinutes) || options.maximumRuntimeMinutes < 1)
-  ) throw new TypeError("Runpod maximumRuntimeMinutes must be at least 1");
+    (
+      !Number.isFinite(options.maximumRuntimeMinutes) ||
+      options.maximumRuntimeMinutes <= CLEANUP_HEADROOM_MS / 60_000
+    )
+  ) {
+    throw new TypeError(
+      "Runpod maximumRuntimeMinutes must exceed the 5 minute cleanup reserve",
+    );
+  }
   if (
     options.maximumRuntimeMinutes !== undefined &&
     options.maximumRuntimeMinutes > 360

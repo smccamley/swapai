@@ -193,18 +193,23 @@ export interface TrainingProvider {
   ): Promise<void>;
 }
 
+export interface TrainingCompletionResult {
+  readonly status: "candidate" | "rejected";
+  readonly trainingRunId: string;
+  readonly datasetRevisionId: string;
+}
+
 export type TrainingRequestResult =
   | {
       readonly status: "not_ready";
       readonly deficits: readonly DatasetDeficit[];
     }
+  | TrainingCompletionResult
   | {
-      readonly status: "candidate" | "rejected";
-      readonly trainingRunId: string;
-      readonly datasetRevisionId: string;
-    }
-  | {
-      readonly status: "already_running" | "already_promoted";
+      readonly status:
+        | "already_running"
+        | "already_promoted"
+        | "already_failed";
       readonly trainingRunId: string;
       readonly datasetRevisionId: string;
     };
@@ -322,6 +327,7 @@ export interface ConfiguredClassifier<
   ): void;
   inspect(): ClassifierInspection;
   requestTraining(): Promise<TrainingRequestResult>;
+  retryTraining(trainingRunId: string): Promise<TrainingCompletionResult>;
   promoteCandidate(trainingRunId: string): Promise<TrainingPromotionResult>;
   reconcileTraining(): Promise<readonly TrainingRunInspection[]>;
   erase(): Promise<void>;

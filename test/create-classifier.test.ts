@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createClassifier, init } from "../src/index.js";
+import { createDatasetPolicy } from "../src/dataset-policy.js";
 import type { TrainingJob, TrainingProvider } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -26,6 +27,70 @@ afterEach(() => {
 });
 
 describe("createClassifier", () => {
+  it("opens data collected by the legacy API through the configured operator API", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "accountant-relevance:source-1";
+    const result = { type: "number" as const, min: 0, max: 1 };
+    const datasetRequirements = {
+      minimumTrainingExamples: 1,
+      minimumTrainingExamplesPerResultBin: 0,
+      minimumValidationExamplesPerResultBin: 0,
+      minimumRepresentativeTestExamples: 0,
+      minimumCoverageTestExamplesPerResultBin: 0,
+    };
+    const datasetPolicy = createDatasetPolicy(result, {
+      decisionBoundaries: [0.5],
+      facets: ["documentFamily"],
+      requirements: datasetRequirements,
+    });
+    const runtime = init({
+      name,
+      result,
+      retrainOnCount: 50,
+      acceptableError: "10%",
+      retestInterval: 100,
+      retestRevertOn: 3,
+      model: "needle2",
+      maxTrainingSet: 10_000,
+      automaticTraining: false,
+      datasetPolicy,
+      dataDirectory,
+    });
+    runtime.logClassification("invoice", 0.9, {
+      documentFamily: "invoice",
+    });
+    await runtime.flush();
+    await runtime.close();
+
+    const operator = createClassifier({
+      name,
+      result,
+      reference: async () => 0.9,
+      decisionBoundaries: [0.5],
+      facets: ["documentFamily"] as const,
+      acceptableError: "10%",
+      maxTrainingSet: 10_000,
+      datasetRequirements,
+      dataDirectory,
+    });
+    expect(operator.inspect()).toMatchObject({
+      name,
+      totalExamplesLogged: 1,
+      retainedExamples: 1,
+    });
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM classifiers WHERE name = ?
+      `).get(name)).toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+    await operator.close();
+  });
+
   it("migrates the exact database schema published by 0.3.0", async () => {
     const dataDirectory = makeDirectory();
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
@@ -431,7 +496,8 @@ describe("createClassifier", () => {
         (example) => example.purpose === "training",
       ),
     ).toBe(true);
-    expect(relevance.inspect().latestTrainingRun).toMatchObject({
+    const failedRun = relevance.inspect().latestTrainingRun!;
+    expect(failedRun).toMatchObject({
       id: receivedJobs[0]!.id,
       provider: "recording-trainer",
       status: "failed",
@@ -444,6 +510,56 @@ describe("createClassifier", () => {
         message: "machine did not terminate",
       },
     });
+    await expect(relevance.requestTraining()).resolves.toEqual({
+      status: "already_failed",
+      trainingRunId: failedRun.id,
+      datasetRevisionId: failedRun.datasetRevisionId,
+    });
+    expect(receivedJobs).toHaveLength(1);
+    await expect(relevance.retryTraining(failedRun.id)).rejects.toThrow(
+      /reconciled before retry/i,
+    );
+    expect(receivedJobs).toHaveLength(1);
+    await relevance.close();
+  });
+
+  it("spends again after failure only through explicit retry", async () => {
+    const attempts: TrainingJob[] = [];
+    const trainingFailure = new Error("trainer unavailable");
+    const relevance = createClassifier({
+      name: "explicit-training-retry",
+      result: { type: "boolean" },
+      reference: async (input) => input.includes("yes"),
+      training: {
+        name: "retry-test",
+        train: async (job) => {
+          attempts.push(job);
+          throw trainingFailure;
+        },
+      },
+      dataDirectory: makeDirectory(),
+      datasetRequirements: {
+        minimumTrainingExamples: 0,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 0,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+    });
+    for (let index = 0; index < 200; index += 1) {
+      await relevance.classify(`${index % 2 === 0 ? "yes" : "no"}-${index}`);
+    }
+
+    await expect(relevance.requestTraining()).rejects.toBe(trainingFailure);
+    const failedRun = relevance.inspect().latestTrainingRun!;
+    await expect(relevance.requestTraining()).resolves.toMatchObject({
+      status: "already_failed",
+      trainingRunId: failedRun.id,
+    });
+    expect(attempts).toHaveLength(1);
+    await expect(relevance.retryTraining(failedRun.id)).rejects.toBe(trainingFailure);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]!.id).not.toBe(failedRun.id);
     await relevance.close();
   });
 });

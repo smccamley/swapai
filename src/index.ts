@@ -29,6 +29,7 @@ export type {
   TrainingCandidate,
   TrainingExample,
   TrainingCleanupStatus,
+  TrainingCompletionResult,
   TrainingEvaluationInspection,
   TrainingJob,
   TrainingLifecycleReporter,

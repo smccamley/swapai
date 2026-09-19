@@ -14,6 +14,7 @@ import {
   promoteCandidate,
   reconcileTraining,
   requestTraining,
+  retryTraining,
 } from "../src/effect.js";
 import { SwapAIError } from "../src/errors.js";
 import type { Classifier, ConfiguredClassifier } from "../src/types.js";
@@ -48,6 +49,9 @@ describe("Effect adapter", () => {
         latestTrainingRun: null, trainingRuns: [],
       }),
       requestTraining: async () => ({ status: "not_ready", deficits: [] }),
+      retryTraining: async (trainingRunId) => ({
+        status: "rejected", trainingRunId, datasetRevisionId: "revision",
+      }),
       promoteCandidate: async (trainingRunId) => ({
         status: "promoted", trainingRunId, datasetRevisionId: "revision",
       }),
@@ -74,6 +78,8 @@ describe("Effect adapter", () => {
     });
     await expect(Effect.runPromise(requestTraining(configured))).resolves
       .toMatchObject({ status: "not_ready" });
+    await expect(Effect.runPromise(retryTraining(configured, "run"))).resolves
+      .toMatchObject({ status: "rejected" });
     await expect(Effect.runPromise(promoteCandidate(configured, "run"))).resolves
       .toMatchObject({ status: "promoted" });
     await expect(Effect.runPromise(reconcileTraining(configured))).resolves.toEqual([]);

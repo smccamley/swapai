@@ -163,21 +163,76 @@ describe("manual training promotion", () => {
     expect(identities[0]).not.toBe(identities[1]);
   });
 
+  it("fails promotion when the stored numeric artifact was changed", async () => {
+    const dataDirectory = mkdtempSync(join(tmpdir(), "swapai-tampered-artifact-"));
+    temporaryDirectories.push(dataDirectory);
+    const name = "tampered-numeric-artifact";
+    const classifier = createClassifier({
+      name,
+      result: { type: "number", min: 0, max: 1 },
+      reference: async (input) => input.startsWith("high-") ? 0.9 : 0.1,
+      training: {
+        name: "numeric-test",
+        train: async (job) => {
+          const modelPath = join(job.outputDirectory, "model.cact");
+          writeFileSync(modelPath, "model");
+          writeFileSync(`${modelPath}.numbers.json`, "original labels");
+          return {
+            modelPath,
+            needleVersion: "2.0.14/number-buckets-v1",
+          };
+        },
+      },
+      dataDirectory,
+      datasetRequirements: {
+        minimumTrainingExamples: 0,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 0,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+    });
+    for (let index = 0; index < 100; index += 1) {
+      await classifier.classify(`${index % 2 === 0 ? "high" : "low"}-${index}`);
+    }
+    const training = await classifier.requestTraining();
+    if (training.status !== "candidate") throw new Error("expected candidate");
+    await classifier.classify("high-shadow");
+    await classifier.flush();
+    const run = classifier.inspect().latestTrainingRun!;
+    const artifactDirectory = join(
+      dataDirectory,
+      "classifiers",
+      createHash("sha256").update(name).digest("hex"),
+      "artifacts",
+      "sha256",
+      run.artifactSha256!,
+    );
+    writeFileSync(join(artifactDirectory, "model.cact.numbers.json"), "tampered");
+
+    await expect(classifier.promoteCandidate(training.trainingRunId))
+      .rejects.toThrow(/SHA-256/i);
+    expect(classifier.isTrained()).toBe(false);
+    expect(classifier.inspect().latestTrainingRun?.status).toBe("candidate");
+    await classifier.close();
+  });
+
   it("removes rejected candidate artifacts but retains evaluation evidence", async () => {
     const dataDirectory = mkdtempSync(join(tmpdir(), "swapai-rejected-artifact-"));
     temporaryDirectories.push(dataDirectory);
     const name = "rejected-artifact";
+    const train = vi.fn(async (job: { outputDirectory: string }) => {
+      const modelPath = join(job.outputDirectory, "model.cact");
+      writeFileSync(modelPath, "rejected model");
+      return { modelPath, needleVersion: "2.0.14" };
+    });
     const classifier = createClassifier({
       name,
       result: { type: "boolean" },
       reference: async () => false,
       training: {
         name: "rejecting-test",
-        train: async (job) => {
-          const modelPath = join(job.outputDirectory, "model.cact");
-          writeFileSync(modelPath, "rejected model");
-          return { modelPath, needleVersion: "2.0.14" };
-        },
+        train,
       },
       dataDirectory,
       datasetRequirements: {
@@ -212,6 +267,8 @@ describe("manual training promotion", () => {
       run.artifactSha256!,
     );
     expect(existsSync(artifactDirectory)).toBe(false);
+    await expect(classifier.requestTraining()).resolves.toEqual(training);
+    expect(train).toHaveBeenCalledOnce();
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
       readOnly: true,
     });

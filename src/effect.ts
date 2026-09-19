@@ -137,6 +137,14 @@ export const requestTraining = <Result extends ResultValue, FacetName extends st
   catch: classificationFailure,
 });
 
+export const retryTraining = <Result extends ResultValue, FacetName extends string>(
+  classifier: ConfiguredClassifier<Result, FacetName>,
+  trainingRunId: string,
+) => Effect.tryPromise({
+  try: () => classifier.retryTraining(trainingRunId),
+  catch: classificationFailure,
+});
+
 export const promoteCandidate = <Result extends ResultValue, FacetName extends string>(
   classifier: ConfiguredClassifier<Result, FacetName>,
   trainingRunId: string,

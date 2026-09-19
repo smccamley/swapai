@@ -282,19 +282,19 @@ const recordCandidateEvaluation = (options: {
   }
 };
 
-export const promoteCandidate = (options: {
+export const promoteCandidate = async (options: {
   readonly dataDirectory: string;
   readonly classifierName: string;
   readonly trainingRunId: string;
   readonly acceptableError: number;
-}): { readonly datasetRevisionId: string } => {
+  readonly result: ResultConfig;
+}): Promise<{ readonly datasetRevisionId: string }> => {
   const database = new DatabaseSync(join(options.dataDirectory, "swapai.sqlite"));
   database.function("swapai_writer_version", { deterministic: true }, () => 3);
   database.exec("PRAGMA foreign_keys = ON");
   database.exec("PRAGMA busy_timeout = 5000");
-  database.exec("BEGIN IMMEDIATE");
   try {
-    const run = database.prepare(`
+    const candidateStatement = database.prepare(`
       SELECT
         r.dataset_revision_id,
         r.artifact_sha256,
@@ -308,18 +308,59 @@ export const promoteCandidate = (options: {
         ON a.classifier_name = r.classifier_name
        AND a.sha256 = r.artifact_sha256
       WHERE r.id = ? AND r.classifier_name = ? AND r.status = 'candidate'
-    `).get(options.trainingRunId, options.classifierName) as {
+    `);
+    type CandidateRow = {
       dataset_revision_id: string;
       artifact_sha256: string;
       generation: number;
       data_epoch: number;
       model_path: string;
       needle_version: string;
-    } | undefined;
-    if (run === undefined) {
+    };
+    const candidateBeforeHash = candidateStatement.get(
+      options.trainingRunId,
+      options.classifierName,
+    ) as CandidateRow | undefined;
+    if (candidateBeforeHash === undefined) {
       throw new SwapAIError(
         "invalid_result",
         `Training run "${options.trainingRunId}" is not a promotable candidate`,
+      );
+    }
+    let artifactIdentity: Awaited<ReturnType<typeof hashModelArtifact>>;
+    try {
+      artifactIdentity = await hashModelArtifact(
+        candidateBeforeHash.model_path,
+        options.result,
+      );
+    } catch (error) {
+      throw new SwapAIError(
+        "invalid_result",
+        "Candidate artifact is missing or unreadable",
+        { cause: error },
+      );
+    }
+    if (artifactIdentity.sha256 !== candidateBeforeHash.artifact_sha256) {
+      throw new SwapAIError(
+        "invalid_result",
+        "Candidate artifact failed SHA-256 verification",
+      );
+    }
+    database.exec("BEGIN IMMEDIATE");
+    const run = candidateStatement.get(
+      options.trainingRunId,
+      options.classifierName,
+    ) as CandidateRow | undefined;
+    if (
+      run === undefined ||
+      run.dataset_revision_id !== candidateBeforeHash.dataset_revision_id ||
+      run.artifact_sha256 !== artifactIdentity.sha256 ||
+      run.model_path !== candidateBeforeHash.model_path ||
+      run.needle_version !== candidateBeforeHash.needle_version
+    ) {
+      throw new SwapAIError(
+        "invalid_result",
+        "Candidate changed while its artifact was being verified",
       );
     }
     const shadow = database.prepare(`
@@ -377,7 +418,7 @@ export const promoteCandidate = (options: {
     database.exec("COMMIT");
     return { datasetRevisionId: run.dataset_revision_id };
   } catch (error) {
-    database.exec("ROLLBACK");
+    if (database.isTransaction) database.exec("ROLLBACK");
     throw error;
   } finally {
     database.close();

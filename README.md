@@ -61,9 +61,14 @@ if (inspection.readyForTraining) {
 ```
 
 `requestTraining()` returns `not_ready`, `candidate`, `rejected`,
-`already_running`, or `already_promoted`. Requests for the same immutable
-dataset revision and provider are deduplicated, so retries cannot create a
-second paid run.
+`already_running`, `already_promoted`, or `already_failed`. Every terminal
+outcome is deduplicated for the same immutable dataset revision and provider,
+so workflow retries cannot create a second paid run. Spending on an intentional
+retry is explicit:
+
+```ts
+await relevance.retryTraining(failedOrRejectedRunId);
+```
 
 A passing protected evaluation creates an unpromoted candidate. Fresh traffic
 is then evaluated in shadow mode: the reference answer remains authoritative,
@@ -97,6 +102,8 @@ facet groups rather than keeping only recent majority traffic.
 enforces the declared time and cost ceilings, records the Pod ID immediately,
 and verifies termination on success and failure. `reconcileTraining()` checks
 durable running records after a controller restart and terminates expired Pods.
+The paid training deadline reserves five minutes for verified deletion inside
+the earlier of the runtime and cost limits.
 
 The default image is
 `ghcr.io/smccamley/swapai-trainer:0.5.0`. The image pins
@@ -152,8 +159,9 @@ evaluation. New integrations should normally use `createClassifier()`.
 ## Effect
 
 `@swapai/core/effect` exposes typed Effects for the full configured lifecycle:
-create, classify, log, inspect, request training, promote, reconcile, erase,
-flush, and close. The Promise interface remains available from `@swapai/core`.
+create, classify, log, inspect, request or explicitly retry training, promote,
+reconcile, erase, flush, and close. The Promise interface remains available
+from `@swapai/core`.
 
 Needle source and fine-tuning details are documented by
 [cactus-compute/needle](https://github.com/cactus-compute/needle). Runpod v2 is
