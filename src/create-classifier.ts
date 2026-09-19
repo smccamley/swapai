@@ -39,7 +39,7 @@ export const createClassifier = <
   const classifier = init({
     name: config.name,
     result: config.result,
-    retrainOnCount: config.maxTrainingSet ?? DEFAULT_MAX_TRAINING_SET,
+    retrainOnCount: Math.min(50, config.maxTrainingSet ?? DEFAULT_MAX_TRAINING_SET),
     acceptableError,
     retestInterval: 100,
     retestRevertOn: 3,
