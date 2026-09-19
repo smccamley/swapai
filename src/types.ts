@@ -77,6 +77,7 @@ export interface Classifier<Result extends ResultValue> {
     facets?: ClassificationFacets<string>,
   ): void;
   clearTrainingData(): void;
+  erase(): Promise<void>;
   classify(
     input: string,
     referenceClassifier?: ReferenceClassifier<Result>,
@@ -126,7 +127,7 @@ export interface TrainingExample {
   readonly input: string;
   readonly result: ResultValue;
   readonly resultBin: string;
-  readonly purpose: "training" | "validation";
+  readonly purpose: "training";
   readonly facets: ClassificationFacets<string>;
 }
 
@@ -149,9 +150,47 @@ export interface TrainingCandidate {
   readonly costUsd?: number;
 }
 
+export interface TrainingResource {
+  readonly type: string;
+  readonly id: string;
+}
+
+export type TrainingCleanupStatus =
+  | "not_required"
+  | "pending"
+  | "succeeded"
+  | "failed";
+
+export interface TrainingLifecycleReporter {
+  recordProviderRun(details: {
+    readonly providerRunId: string;
+    readonly resources: readonly TrainingResource[];
+  }): void;
+  recordCleanup(details: {
+    readonly status: Exclude<TrainingCleanupStatus, "not_required">;
+    readonly message?: string;
+  }): void;
+}
+
+export interface TrainingReconciliationResult {
+  readonly status: "running" | "failed";
+  readonly failureMessage?: string;
+}
+
 export interface TrainingProvider {
   readonly name: string;
-  train(job: TrainingJob): Promise<TrainingCandidate>;
+  train(
+    job: TrainingJob,
+    lifecycle?: TrainingLifecycleReporter,
+  ): Promise<TrainingCandidate>;
+  reconcile?(
+    run: TrainingRunInspection,
+    lifecycle?: TrainingLifecycleReporter,
+  ): Promise<TrainingReconciliationResult>;
+  cancel?(
+    run: TrainingRunInspection,
+    lifecycle?: TrainingLifecycleReporter,
+  ): Promise<void>;
 }
 
 export type TrainingRequestResult =
@@ -160,10 +199,21 @@ export type TrainingRequestResult =
       readonly deficits: readonly DatasetDeficit[];
     }
   | {
-      readonly status: "promoted" | "rejected";
+      readonly status: "candidate" | "rejected";
+      readonly trainingRunId: string;
+      readonly datasetRevisionId: string;
+    }
+  | {
+      readonly status: "already_running" | "already_promoted";
       readonly trainingRunId: string;
       readonly datasetRevisionId: string;
     };
+
+export interface TrainingPromotionResult {
+  readonly status: "promoted";
+  readonly trainingRunId: string;
+  readonly datasetRevisionId: string;
+}
 
 export interface NumericResultBinInspection {
   readonly id: string;
@@ -200,22 +250,60 @@ export interface ClassifierInspection {
   readonly retainedExamples: number;
   readonly readyForTraining: boolean;
   readonly resultBins: readonly ResultBinInspection[];
+  readonly facetCoverage: readonly FacetValueInspection[];
   readonly deficits: readonly DatasetDeficit[];
   readonly examplesByPurpose: Record<Exclude<DatasetPurpose, "legacy_seen">, number>;
   readonly latestTrainingRun: TrainingRunInspection | null;
+  readonly trainingRuns: readonly TrainingRunInspection[];
+}
+
+export interface FacetValueInspection {
+  readonly facet: string;
+  readonly value: string | null;
+  readonly total: number;
+  readonly purposes: Record<Exclude<DatasetPurpose, "legacy_seen">, number>;
 }
 
 export interface TrainingRunInspection {
   readonly id: string;
   readonly datasetRevisionId: string;
   readonly provider: string;
-  readonly status: "running" | "failed" | "rejected" | "promoted";
+  readonly status:
+    | "running"
+    | "failed"
+    | "rejected"
+    | "candidate"
+    | "promoted";
   readonly providerRunId: string | null;
   readonly costUsd: number | null;
   readonly artifactSha256: string | null;
   readonly failureMessage: string | null;
+  readonly resources: readonly TrainingResource[];
+  readonly cleanup: {
+    readonly status: TrainingCleanupStatus;
+    readonly message: string | null;
+  };
+  readonly evaluations: readonly TrainingEvaluationInspection[];
+  readonly shadow: ShadowEvaluationInspection | null;
   readonly startedAt: number;
   readonly finishedAt: number | null;
+}
+
+export interface ShadowEvaluationInspection {
+  readonly exampleCount: number;
+  readonly meanError: number | null;
+  readonly passed: boolean;
+  readonly failureCount: number;
+  readonly lastFailureMessage: string | null;
+  readonly lastEvaluatedAt: number | null;
+}
+
+export interface TrainingEvaluationInspection {
+  readonly purpose: "validation" | "representative_test" | "coverage_test";
+  readonly resultBin: string | null;
+  readonly exampleCount: number;
+  readonly error: number;
+  readonly passed: boolean;
 }
 
 export interface ConfiguredClassifier<
@@ -234,7 +322,9 @@ export interface ConfiguredClassifier<
   ): void;
   inspect(): ClassifierInspection;
   requestTraining(): Promise<TrainingRequestResult>;
-  clearTrainingData(): void;
+  promoteCandidate(trainingRunId: string): Promise<TrainingPromotionResult>;
+  reconcileTraining(): Promise<readonly TrainingRunInspection[]>;
+  erase(): Promise<void>;
   flush(): Promise<void>;
   close(): Promise<void>;
 }

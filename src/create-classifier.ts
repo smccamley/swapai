@@ -1,16 +1,23 @@
 import { init } from "./classifier.js";
+import { rm } from "node:fs/promises";
 import { readClassifierInspection } from "./dataset-inspection.js";
 import { createDatasetPolicy } from "./dataset-policy.js";
 import {
   createTrainingJob,
+  recordTrainingLifecycle,
   recordTrainingFailure,
 } from "./training-dataset.js";
-import { evaluateAndPromoteCandidate } from "./training-coordinator.js";
+import {
+  evaluateCandidate,
+  promoteCandidate,
+} from "./training-coordinator.js";
 import type {
   ConfiguredClassifier,
   CreateClassifierConfig,
   ResultConfig,
   ResultFor,
+  TrainingLifecycleReporter,
+  TrainingRunInspection,
 } from "./types.js";
 
 const DEFAULT_MAX_TRAINING_SET = 10_000;
@@ -55,20 +62,59 @@ export const createClassifier = <
       : { onBackgroundError: config.onBackgroundError }),
   });
 
+  const lifecycleFor = (trainingRunId: string): TrainingLifecycleReporter => ({
+    recordProviderRun: ({ providerRunId, resources }) =>
+      recordTrainingLifecycle({
+        dataDirectory,
+        trainingRunId,
+        providerRunId,
+        resources,
+        cleanupStatus: "pending",
+      }),
+    recordCleanup: ({ status, message }) =>
+      recordTrainingLifecycle({
+        dataDirectory,
+        trainingRunId,
+        cleanupStatus: status,
+        cleanupMessage: message ?? null,
+      }),
+  });
+
+  const inspect = () => readClassifierInspection({
+    dataDirectory,
+    name: config.name,
+    result: config.result,
+    acceptableError: normalizedAcceptableError,
+    policy: datasetPolicy,
+  });
+
+  const reconcileTraining = async (): Promise<readonly TrainingRunInspection[]> => {
+    const running = inspect().trainingRuns.filter((run) => run.status === "running");
+    for (const run of running) {
+      if (config.training?.name !== run.provider || config.training.reconcile === undefined) {
+        continue;
+      }
+      const result = await config.training.reconcile(run, lifecycleFor(run.id));
+      if (result.status === "failed") {
+        recordTrainingFailure({
+          dataDirectory,
+          trainingRunId: run.id,
+          error: new Error(result.failureMessage ?? "Training provider run failed"),
+        });
+      }
+    }
+    return inspect().trainingRuns;
+  };
+
   return {
     isTrained: () => classifier.isTrained(),
-    classify: (input, facets = {}) =>
-      classifier.classify(input, config.reference, facets),
-    logClassification: (input, result, facets = {}) =>
-      classifier.logClassification(input, result, facets),
-    inspect: () =>
-      readClassifierInspection({
-        dataDirectory,
-        name: config.name,
-        result: config.result,
-        acceptableError: normalizedAcceptableError,
-        policy: datasetPolicy,
-      }),
+    classify: async (input, facets = {}) => {
+      return classifier.classify(input, config.reference, facets);
+    },
+    logClassification: (input, result, facets = {}) => {
+      classifier.logClassification(input, result, facets);
+    },
+    inspect,
     requestTraining: async () => {
       await classifier.flush();
       const inspection = readClassifierInspection({
@@ -93,9 +139,20 @@ export const createClassifier = <
         acceptableError: normalizedAcceptableError,
         providerName: config.training.name,
       });
+      if ("existing" in job) {
+        return {
+          status: job.status === "running"
+            ? "already_running"
+            : job.status === "promoted"
+              ? "already_promoted"
+              : "candidate",
+          trainingRunId: job.id,
+          datasetRevisionId: job.datasetRevisionId,
+        };
+      }
       try {
-        const candidate = await config.training.train(job);
-        const status = await evaluateAndPromoteCandidate({
+        const candidate = await config.training.train(job, lifecycleFor(job.id));
+        const status = await evaluateCandidate({
           dataDirectory,
           job,
           candidate,
@@ -112,10 +169,54 @@ export const createClassifier = <
           error,
         });
         throw error;
+      } finally {
+        await rm(job.outputDirectory, { recursive: true, force: true });
       }
     },
-    clearTrainingData: () => classifier.clearTrainingData(),
-    flush: () => classifier.flush(),
-    close: () => classifier.close(),
+    promoteCandidate: async (trainingRunId) => {
+      await classifier.flush();
+      const promoted = promoteCandidate({
+        dataDirectory,
+        classifierName: config.name,
+        trainingRunId,
+        acceptableError: normalizedAcceptableError,
+      });
+      return {
+        status: "promoted",
+        trainingRunId,
+        datasetRevisionId: promoted.datasetRevisionId,
+      };
+    },
+    reconcileTraining,
+    erase: async () => {
+      await classifier.flush();
+      const runs = inspect().trainingRuns;
+      for (const run of runs.filter((candidate) =>
+        candidate.status === "running" ||
+        candidate.cleanup.status === "pending" ||
+        candidate.cleanup.status === "failed"
+      )) {
+        if (config.training?.name !== run.provider || config.training.cancel === undefined) {
+          throw new TypeError(
+            `Training run "${run.id}" must be cancelled by provider "${run.provider}" before erasure`,
+          );
+        }
+        await config.training.cancel(run, lifecycleFor(run.id));
+        if (run.status === "running") {
+          recordTrainingFailure({
+            dataDirectory,
+            trainingRunId: run.id,
+            error: new Error("Training run cancelled for classifier erasure"),
+          });
+        }
+      }
+      await classifier.erase();
+    },
+    flush: async () => {
+      await classifier.flush();
+    },
+    close: async () => {
+      await classifier.close();
+    },
   };
 };

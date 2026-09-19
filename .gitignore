@@ -5,3 +5,4 @@ coverage/
 *.tgz
 .npmrc
 python/__pycache__/
+trainer/__pycache__/

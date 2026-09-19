@@ -129,7 +129,7 @@ import { delimiter } from "node:path";
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
 const [python, worker, fakePython, control, pidPath, mainDatabase, classifierName, ...workerArgs] = process.argv.slice(2);
 const database = new DatabaseSync(mainDatabase);
-database.function("swapai_writer_version", { deterministic: true }, () => 2);
+database.function("swapai_writer_version", { deterministic: true }, () => 3);
 database.prepare(\`
   UPDATE classifiers
   SET training_lease_owner = ?,

@@ -1,6 +1,6 @@
 {
   "name": "@swapai/core",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Replace paid classifiers with locally trained Needle 2 classifiers.",
   "type": "module",
   "license": "MIT",
@@ -19,6 +19,9 @@
   "files": [
     "dist",
     "python",
+    "trainer/Dockerfile",
+    "trainer/entrypoint.sh",
+    "trainer/train.py",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"

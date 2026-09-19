@@ -7,7 +7,7 @@ import type {
 
 export interface CandidatePrediction extends ResultComparison<ResultValue> {
   readonly input: string;
-  readonly purpose: "representative_test" | "coverage_test";
+  readonly purpose: "validation" | "representative_test" | "coverage_test";
   readonly resultBin: string;
 }
 
@@ -32,6 +32,7 @@ export const evaluateCandidatePredictions = (
 ): CandidateEvaluationEvidence => {
   const metrics: CandidateEvaluationMetric[] = [];
   for (const purpose of [
+    "validation",
     "representative_test",
     "coverage_test",
   ] as const) {

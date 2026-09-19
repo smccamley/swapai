@@ -46,7 +46,17 @@ describe("classifier monitor web server", () => {
         fetch(`${server.url}health`),
       ]);
       expect(page.status).toBe(200);
-      expect(await page.text()).toContain("SwapAI classifiers");
+      const pageBody = await page.text();
+      expect(pageBody).toContain("SwapAI classifiers");
+      expect(pageBody).toContain("Training deficits");
+      expect(pageBody).toContain("Result-bin coverage");
+      expect(pageBody).toContain("Facet coverage");
+      expect(pageBody).toContain("Training run history");
+      expect(pageBody).toContain("Protected evaluation");
+      expect(pageBody).toContain("Shadow evidence");
+      expect(pageBody).toContain("Provider resources");
+      expect(pageBody).toContain("Cleanup");
+      expect(pageBody).not.toContain("modelPath");
       expect(api.status).toBe(200);
       await expect(api.json()).resolves.toMatchObject({
         classifiers: [expect.objectContaining({ name: "currency" })],

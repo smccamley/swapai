@@ -176,12 +176,9 @@ const resultBinFor = <Config extends ResultConfig>(
 const purposeFor = (
   classifierName: string,
   inputHash: string,
-  resultBin: string,
 ): Exclude<DatasetPurpose, "legacy_seen"> => {
   const bucket = createHash("sha256")
     .update(classifierName)
-    .update("\0")
-    .update(resultBin)
     .update("\0")
     .update(inputHash)
     .digest()
@@ -234,7 +231,7 @@ export const prepareExampleMetadata = <Config extends ResultConfig>(
   return {
     inputHash,
     resultBin: bin,
-    purpose: purposeFor(classifierName, inputHash, bin),
+    purpose: purposeFor(classifierName, inputHash),
     facets: normalizedFacets,
   };
 };

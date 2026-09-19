@@ -1,13 +1,16 @@
 # SwapAI
 
-SwapAI collects answers from an existing classifier, trains a small Needle model
-elsewhere, and swaps only after the candidate passes protected tests.
+SwapAI collects answers from an existing classifier, trains a small Needle 2
+model outside the application, evaluates it locally, and keeps the reference
+classifier authoritative until you explicitly promote a candidate.
 
 ```sh
 npm install @swapai/core effect
 ```
 
-## Replace a classifier
+The canonical guide is [stuartmccamley.com/swapai](https://stuartmccamley.com/swapai).
+
+## Quick start
 
 ```ts
 import { createClassifier } from "@swapai/core";
@@ -22,6 +25,8 @@ const relevance = createClassifier({
   training: runpodTrainer({
     apiKey: process.env.RUNPOD_API_KEY!,
     maximumCostUsd: 1,
+    maximumRuntimeMinutes: 30,
+    sshPrivateKey: process.env.SWAPAI_RUNPOD_SSH_PRIVATE_KEY,
   }),
 });
 
@@ -31,129 +36,125 @@ const score = await relevance.classify(input, {
 });
 ```
 
-That is the application interface. Before promotion, `classify` returns the
-Reference Classifier's answer and records it. After promotion, it uses the
-Needle model and periodically checks it against the Reference Classifier.
+Before promotion, `classify()` always returns the reference answer and records
+it. It never starts training.
 
-Training is manual and never starts inside `classify`:
+## Train, review, promote
 
 ```ts
-const dataset = relevance.inspect();
-if (dataset.readyForTraining) {
-  const result = await relevance.requestTraining();
-  console.log(result.status); // promoted or rejected
+const inspection = relevance.inspect();
+if (inspection.readyForTraining) {
+  const request = await relevance.requestTraining();
+
+  if (request.status === "candidate") {
+    // After normal traffic has called classify(), wait for its shadow writes.
+    await relevance.flush();
+    const run = relevance.inspect().trainingRuns.find(
+      ({ id }) => id === request.trainingRunId,
+    );
+
+    if (run?.shadow?.passed) {
+      await relevance.promoteCandidate(request.trainingRunId);
+    }
+  }
 }
 ```
 
-`inspect()` explains missing result ranges and protected-test coverage. A high
-total is not treated as sufficient evidence.
+`requestTraining()` returns `not_ready`, `candidate`, `rejected`,
+`already_running`, or `already_promoted`. Requests for the same immutable
+dataset revision and provider are deduplicated, so retries cannot create a
+second paid run.
 
-## What SwapAI protects
+A passing protected evaluation creates an unpromoted candidate. Fresh traffic
+is then evaluated in shadow mode: the reference answer remains authoritative,
+candidate failures never affect classification, and aggregate shadow error is
+persisted. `promoteCandidate()` requires both passing protected evidence and
+passing fresh shadow evidence.
 
-Every unique input is assigned deterministically to one purpose:
+## Dataset protection
 
-- 65% training
-- 15% validation
-- 10% representative test
-- 10% coverage test
+Each unique input has a stable purpose based only on classifier name and input:
 
-Numeric results are automatically split into ordinary ranges plus smaller
-ranges around declared decision boundaries. Boolean and string results use one
-bin per allowed value. Optional facets preserve useful categories such as
-document family and source kind.
+- training: sent to the selected provider;
+- validation: retained locally for candidate evaluation;
+- representative test: retained locally;
+- coverage test: retained locally.
 
-When storage reaches `maxTrainingSet`, SwapAI evicts old examples from the
-fullest result/purpose/facet cell. Repeated inputs replace their earlier copy.
-This preserves rare examples instead of retaining only the latest traffic.
+Providers receive only training examples. All three evaluation sets remain
+local, so a provider cannot inspect or train against its acceptance exam.
+Numeric results are binned around declared decision boundaries. Boolean and
+string results use one bin per allowed value. `inspect()` reports result-bin
+coverage, declared-facet groups (including unlabelled examples), readiness
+deficits, complete run history, provider resources, cleanup state, protected
+metrics, cost, artifacts, and shadow evidence.
 
-`requestTraining()` freezes an immutable Dataset Revision. The Training
-Provider receives only training and validation examples. Representative and
-coverage tests stay in the control plane. A candidate is promoted only when
-its aggregate and per-result-bin errors all meet `acceptableError`.
+When `maxTrainingSet` is reached, retention balances result bin, purpose, and
+facet groups rather than keeping only recent majority traffic.
 
 ## Runpod
 
-The Runpod provider creates one Secure Pod, uploads one Dataset Revision, runs
-the pinned trainer image, downloads the candidate, and deletes that exact Pod.
-It verifies deletion on success and failure.
-
-```ts
-runpodTrainer({
-  apiKey: process.env.RUNPOD_API_KEY!,
-  maximumCostUsd: 1,
-  maximumRuntimeMinutes: 30,
-  // Optional. Defaults to ~/.ssh/id_ed25519, then ~/.ssh/id_rsa.
-  sshPrivateKey: process.env.SWAPAI_RUNPOD_SSH_PRIVATE_KEY,
-});
-```
-
-The provider rejects a Pod whose hourly price could exceed the declared cost
-ceiling. Pod names contain their hard deadline; later runs remove expired
-SwapAI Pods before allocating another. SwapAI never keeps a Pod intentionally.
+`runpodTrainer()` uses Runpod REST API v2. It creates one Secure Pod by default,
+enforces the declared time and cost ceilings, records the Pod ID immediately,
+and verifies termination on success and failure. `reconcileTraining()` checks
+durable running records after a controller restart and terminates expired Pods.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.4.2`. The image is built from
-[`trainer/Dockerfile`](trainer/Dockerfile) and pins `cactus-needle` 2.0.14 with
-its NVIDIA/JAX training dependencies.
-
-## Other training infrastructure
-
-Training infrastructure implements one small interface:
+`ghcr.io/smccamley/swapai-trainer:0.5.0`. The image pins
+`cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
+`2.0.14/number-buckets-v1`.
 
 ```ts
-import type { TrainingProvider } from "@swapai/core";
-
-const awsTrainer: TrainingProvider = {
-  name: "aws",
-  async train(job) {
-    // Upload job.examples, run the trainer, download model.cact.
-    return { modelPath, needleVersion: "2.0.14", providerRunId };
-  },
-};
+await relevance.reconcileTraining();
 ```
 
-For a Mac, Windows machine, or a persistent worker, use `localTrainer()` or
-implement the same interface. `localTrainer()` is explicit; SwapAI does not
-silently train on the application host.
+Runpod authentication uses `RUNPOD_API_KEY`. SSH uses the configured private
+key; the corresponding public key is injected only into the temporary Pod.
 
-## Observe classifiers
+## Local and custom providers
+
+`localTrainer()` uses the same version-2 runner contract as Runpod: SHA-256
+verified training input, result manifest, model, and numeric sidecar. Training
+bundles are deleted after every completed or failed request.
+
+Custom providers implement `TrainingProvider`. Use its lifecycle reporter to
+persist the provider run ID, resources, and cleanup result immediately. Supply
+`reconcile()` and `cancel()` when the provider owns external resources.
+
+## Observe
 
 ```sh
 npx @swapai/core classifiers-ui --data-directory .swapai
 ```
 
-Open `http://127.0.0.1:4789`. The read-only viewer shows retained versus
-observed examples, every dataset purpose, readiness gaps, trainer/provider,
-cost, candidate status, protected-test error, and promoted model state. It does
-not expose classification inputs, credentials, or model paths.
-
-Applications can use the same read-only library:
+Or use the read-only API:
 
 ```ts
 import { readClassifierStatuses } from "@swapai/core/classifiers-ui";
 
-const classifiers = readClassifierStatuses({ dataDirectory: ".swapai" });
+const statuses = readClassifierStatuses({ dataDirectory: ".swapai" });
 ```
 
-## Erasure
+## Erase
 
 ```ts
-relevance.clearTrainingData();
-await relevance.flush();
+await relevance.erase();
 ```
 
-This prevents further use of the model immediately, then securely deletes that
-classifier's examples, Dataset Revisions, Training Runs, and generation state.
-Other classifiers are untouched.
+`erase()` first cancels and verifies provider cleanup, then removes examples,
+dataset revisions, run rows, transient bundles, complete content-addressed
+artifacts, and numeric sidecars. It refuses to certify erasure while an
+external resource is still live or cleanup failed.
 
-## Compatibility
+The legacy `init()` interface remains available for applications that supply a
+reference callback per request. It also supports `erase()` and persisted shadow
+evaluation. New integrations should normally use `createClassifier()`.
 
-The original `init()` interface remains available for existing applications.
-New applications should use `createClassifier()`: it configures the Reference
-Classifier once and disables in-process automatic training.
+## Effect
 
-Needle's official fine-tuning guide documents LoRA training, GPU/Metal extras,
-and the `.cact` artifact format:
-[cactus-compute/needle](https://github.com/cactus-compute/needle/blob/main/doc/finetuning.md).
-Runpod documents Pods and API keys at
-[docs.runpod.io](https://docs.runpod.io/).
+`@swapai/core/effect` exposes typed Effects for the full configured lifecycle:
+create, classify, log, inspect, request training, promote, reconcile, erase,
+flush, and close. The Promise interface remains available from `@swapai/core`.
+
+Needle source and fine-tuning details are documented by
+[cactus-compute/needle](https://github.com/cactus-compute/needle). Runpod v2 is
+documented at [docs.runpod.io](https://docs.runpod.io/api-reference-v2/overview).

@@ -115,4 +115,56 @@ describe("classifier status", () => {
       status!.resultBins.reduce((total, bin) => total + bin.total, 0),
     ).toBe(1);
   });
+
+  it("bounds observer history without deleting durable training runs", () => {
+    const dataDirectory = makeDirectory();
+    const name = "bounded-observer-history";
+    const storage = openStorage({
+      dataDirectory,
+      name,
+      config: {
+        result: { type: "boolean" },
+        acceptableError: 0.1,
+        retrainOnCount: 50,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+      maxTrainingSet: 10_000,
+    });
+    storage.close();
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database.exec("PRAGMA foreign_keys = ON");
+    database.prepare(`
+      INSERT INTO dataset_revisions (
+        id, classifier_name, generation, data_epoch, created_at
+      ) VALUES (?, ?, 1, 0, 0)
+    `).run("revision", name);
+    const insertRun = database.prepare(`
+      INSERT INTO training_runs (
+        id, dataset_revision_id, classifier_name, provider_name, status,
+        started_at, finished_at
+      ) VALUES (?, 'revision', ?, 'test', 'failed', ?, ?)
+    `);
+    for (let index = 0; index < 101; index += 1) {
+      insertRun.run(`run-${index}`, name, index, index);
+    }
+    expect(database.prepare("SELECT COUNT(*) AS count FROM training_runs").get())
+      .toEqual({ count: 101 });
+    database.close();
+
+    const [status] = readClassifierStatuses({ dataDirectory });
+    expect(status!.trainingRuns).toHaveLength(100);
+    expect(status!.trainingRuns[0]!.id).toBe("run-100");
+    const verification = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      expect(verification.prepare("SELECT COUNT(*) AS count FROM training_runs").get())
+        .toEqual({ count: 101 });
+    } finally {
+      verification.close();
+    }
+  });
 });

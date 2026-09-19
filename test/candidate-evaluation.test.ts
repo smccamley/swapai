@@ -5,6 +5,13 @@ import { evaluateCandidatePredictions } from "../src/candidate-evaluation.js";
 describe("candidate promotion evidence", () => {
   it("rejects a low constant prediction even when its aggregate error looks good", () => {
     const predictions = [
+      {
+        purpose: "validation" as const,
+        resultBin: "0..0.2",
+        reference: 0,
+        candidate: 0,
+        input: "validation-negative",
+      },
       ...Array.from({ length: 98 }, (_, index) => ({
         purpose: "representative_test" as const,
         resultBin: "0..0.2",

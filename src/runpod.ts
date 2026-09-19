@@ -3,17 +3,20 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { Effect } from "effect";
-
-import { writeTrainingBundle } from "./training-bundle.js";
+import { needleModelVersion } from "./runtime.js";
+import {
+  verifyTrainingResult,
+  writeTrainingBundle,
+} from "./training-bundle.js";
 import type {
   TrainingCandidate,
   TrainingJob,
+  TrainingLifecycleReporter,
   TrainingProvider,
 } from "./types.js";
 
-const RUNPOD_API = "https://rest.runpod.io/v1";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.4.2";
+const RUNPOD_API = "https://api.runpod.io/v2";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.5.0";
 const DEFAULT_GPU_TYPES = [
   "NVIDIA A40",
   "NVIDIA RTX A5000",
@@ -26,6 +29,8 @@ export interface RunpodTrainerOptions {
   readonly maximumRuntimeMinutes?: number;
   readonly image?: string;
   readonly gpuTypes?: readonly string[];
+  readonly cloud?: "SECURE" | "COMMUNITY";
+  /** @deprecated Use cloud. */
   readonly cloudType?: "SECURE" | "COMMUNITY";
   readonly sshPrivateKey?: string;
 }
@@ -43,11 +48,15 @@ export interface RunpodTrainerDependencies {
 interface RunpodPod {
   readonly id: string;
   readonly name: string;
-  readonly desiredStatus?: string;
-  readonly publicIp?: string;
-  readonly portMappings?: Readonly<Record<string, number>>;
-  readonly costPerHr?: number;
-  readonly adjustedCostPerHr?: number;
+  readonly status?: string;
+  readonly cost?: number;
+  readonly ssh?: {
+    readonly direct?: {
+      readonly host: string;
+      readonly port: number;
+      readonly username: string;
+    } | null;
+  } | null;
 }
 
 export const runpodTrainer = (
@@ -65,40 +74,36 @@ export const runpodTrainer = (
 
   return {
     name: "runpod",
-    train: (job) => Effect.runPromise(Effect.acquireUseRelease(
-      Effect.tryPromise({
-        try: async () => {
-          await removeExpiredManagedPods(api, now(), sleep);
-          const privateKey = resolvePrivateKey(options.sshPrivateKey);
-          const publicKey = (await runCommand(
-            "ssh-keygen",
-            ["-y", "-f", privateKey],
-          )).stdout.trim();
-          if (publicKey === "") throw new Error("SSH public key is empty");
-          const deadline = now() + runtimeMinutes * 60_000;
-          const pod = await api.createPod({
-            name: `swapai-${deadline}-${job.id}`,
-            cloudType: options.cloudType ?? "SECURE",
-            computeType: "GPU",
-            imageName: options.image ?? DEFAULT_IMAGE,
-            gpuTypeIds: options.gpuTypes ?? DEFAULT_GPU_TYPES,
-            gpuTypePriority: "availability",
-            gpuCount: 1,
-            containerDiskInGb: 30,
-            volumeInGb: 0,
-            minVCPUPerGPU: 4,
-            minRAMPerGPU: 16,
-            ports: ["22/tcp"],
-            supportPublicIp: true,
-            interruptible: false,
-            env: { SSH_PUBLIC_KEY: publicKey, PUBLIC_KEY: publicKey },
-          });
-          return { pod, privateKey, startedAt: now() };
+    train: async (job, lifecycle) => {
+      await removeExpiredManagedPods(api, now(), sleep);
+      const privateKey = resolvePrivateKey(options.sshPrivateKey);
+      const publicKey = (await runCommand(
+        "ssh-keygen",
+        ["-y", "-f", privateKey],
+      )).stdout.trim();
+      if (publicKey === "") throw new Error("SSH public key is empty");
+      const deadline = now() + runtimeMinutes * 60_000;
+      const billingStartedAt = now();
+      const pod = await createPodForFirstAvailableGpu(
+        api,
+        options.gpuTypes ?? DEFAULT_GPU_TYPES,
+        {
+          name: `swapai-${deadline}-${job.id}`,
+          cloud: options.cloud ?? options.cloudType ?? "SECURE",
+          image: options.image ?? DEFAULT_IMAGE,
+          disk: 30,
+          ports: ["22/tcp"],
+          env: { SSH_PUBLIC_KEY: publicKey, PUBLIC_KEY: publicKey },
         },
-        catch: asError,
-      }),
-      ({ pod, privateKey, startedAt }) => Effect.tryPromise({
-        try: () => withTimeout(
+      );
+      let result: TrainingCandidate | undefined;
+      let trainingError: unknown;
+      try {
+        lifecycle?.recordProviderRun({
+          providerRunId: pod.id,
+          resources: [{ type: "runpod-pod", id: pod.id }],
+        });
+        result = await withTimeout(
           usePod({
             api,
             job,
@@ -109,18 +114,78 @@ export const runpodTrainer = (
             runCommand,
             sleep,
             now,
-            startedAt,
+            startedAt: billingStartedAt,
           }),
           runtimeMinutes * 60_000,
           `Runpod training exceeded ${runtimeMinutes} minutes`,
-        ),
-        catch: asError,
-      }),
-      ({ pod }) => Effect.tryPromise({
-        try: () => deletePodVerified(api, pod.id, sleep),
-        catch: asError,
-      }).pipe(Effect.orDie),
-    )),
+        );
+      } catch (error) {
+        trainingError = error;
+      }
+      let cleanupError: unknown;
+      try {
+        await deletePodAndReport(api, pod.id, sleep, lifecycle);
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (trainingError !== undefined && cleanupError !== undefined) {
+        throw new AggregateError(
+          [trainingError, cleanupError],
+          "Runpod training and Pod cleanup both failed",
+        );
+      }
+      if (trainingError !== undefined) throw trainingError;
+      if (cleanupError !== undefined) throw cleanupError;
+      return result!;
+    },
+    cancel: async (run, lifecycle) => {
+      if (run.providerRunId === null) {
+        throw new Error(`Training run ${run.id} has no Runpod Pod ID`);
+      }
+      await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
+    },
+    reconcile: async (run, lifecycle) => {
+      if (run.providerRunId === null) {
+        return {
+          status: "failed",
+          failureMessage: "Running training record has no Runpod Pod ID",
+        };
+      }
+      if (now() >= run.startedAt + runtimeMinutes * 60_000) {
+        await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
+        return {
+          status: "failed",
+          failureMessage: `Runpod training exceeded ${runtimeMinutes} minutes`,
+        };
+      }
+      try {
+        const pod = await api.getPod(run.providerRunId);
+        if (pod.status === "TERMINATED") {
+          lifecycle?.recordCleanup({ status: "succeeded" });
+          return {
+            status: "failed",
+            failureMessage: `Runpod Pod ended with status ${pod.status}`,
+          };
+        }
+        if (pod.status === "EXITED" || pod.status === "ERROR") {
+          await deletePodAndReport(api, run.providerRunId, sleep, lifecycle);
+          return {
+            status: "failed",
+            failureMessage: `Runpod Pod ended with status ${pod.status}`,
+          };
+        }
+        return { status: "running" };
+      } catch (error) {
+        if (hasStatus(error, 404)) {
+          lifecycle?.recordCleanup({ status: "succeeded" });
+          return {
+            status: "failed",
+            failureMessage: "Runpod Pod no longer exists",
+          };
+        }
+        throw error;
+      }
+    },
   };
 };
 
@@ -136,7 +201,7 @@ const usePod = async (options: {
   readonly now: () => number;
   readonly startedAt: number;
 }): Promise<TrainingCandidate> => {
-  const hourlyCost = options.pod.adjustedCostPerHr ?? options.pod.costPerHr;
+  const hourlyCost = options.pod.cost;
   if (hourlyCost === undefined || !Number.isFinite(hourlyCost)) {
     throw new Error("Runpod did not report the Pod hourly cost");
   }
@@ -153,10 +218,11 @@ const usePod = async (options: {
     options.sleep,
   );
   const ssh = sshArguments(
-    connected.publicIp!,
-    connected.portMappings?.["22"]!,
+    connected.ssh!.direct!.host,
+    connected.ssh!.direct!.port,
     options.privateKey,
     join(options.job.outputDirectory, "runpod-known-hosts"),
+    connected.ssh!.direct!.username,
   );
   await waitForSsh(ssh, options.runCommand, options.sleep);
   const bundleDirectory = await writeTrainingBundle(options.job);
@@ -171,7 +237,12 @@ const usePod = async (options: {
     ...ssh,
     `python /opt/swapai/train.py --job-directory ${remoteDirectory}`,
   ]);
-  const modelPath = join(options.job.outputDirectory, "model.cact");
+  await options.runCommand("scp", [
+    ...scpConnectionArguments(ssh),
+    `${ssh.at(-1)!}:${remoteDirectory}/result.json`,
+    join(bundleDirectory, "result.json"),
+  ]);
+  const modelPath = join(bundleDirectory, "model.cact");
   await options.runCommand("scp", [
     ...scpConnectionArguments(ssh),
     `${ssh.at(-1)!}:${remoteDirectory}/model.cact`,
@@ -184,9 +255,14 @@ const usePod = async (options: {
       `${modelPath}.numbers.json`,
     ]);
   }
+  const verified = await verifyTrainingResult(bundleDirectory);
+  if (verified.needleVersion !== needleModelVersion(options.job.result)) {
+    throw new Error(
+      `Trainer returned Needle ${verified.needleVersion}; expected ${needleModelVersion(options.job.result)}`,
+    );
+  }
   return {
-    modelPath,
-    needleVersion: "2.0.14",
+    ...verified,
     providerRunId: options.pod.id,
     costUsd: hourlyCost * Math.max(0, options.now() - options.startedAt) / 3_600_000,
   };
@@ -224,16 +300,37 @@ const createRunpodApi = (
       body: JSON.stringify(body),
     }),
     listPods: async (): Promise<readonly RunpodPod[]> => {
-      const response = await request<readonly RunpodPod[] | { pods?: readonly RunpodPod[] }>("/pods");
-      return Array.isArray(response)
-        ? response
-        : "pods" in response
-          ? response.pods ?? []
-          : [];
+      const response = await request<{ pods?: readonly RunpodPod[] }>("/pods");
+      return response.pods ?? [];
     },
     getPod: (id: string) => request<RunpodPod>(`/pods/${id}`),
     deletePod: (id: string) => request<unknown>(`/pods/${id}`, { method: "DELETE" }),
   };
+};
+
+const createPodForFirstAvailableGpu = async (
+  api: ReturnType<typeof createRunpodApi>,
+  gpuTypes: readonly string[],
+  body: Readonly<Record<string, unknown>>,
+): Promise<RunpodPod> => {
+  let lastError: unknown;
+  for (const gpuType of gpuTypes) {
+    try {
+      return await api.createPod({
+        ...body,
+        gpu: {
+          id: gpuType,
+          count: 1,
+          minVcpuCountPerGpu: 4,
+          minRamPerGpu: 16,
+        },
+      });
+    } catch (error) {
+      lastError = error;
+      if (!hasStatus(error, 400) && !hasStatus(error, 404)) throw error;
+    }
+  }
+  throw lastError ?? new Error("Runpod has no configured GPU type");
 };
 
 const removeExpiredManagedPods = async (
@@ -244,7 +341,7 @@ const removeExpiredManagedPods = async (
   const pods = await api.listPods();
   for (const pod of pods) {
     const match = /^swapai-(\d+)-/.exec(pod.name);
-    if (match !== null && Number(match[1]) <= now && pod.desiredStatus !== "TERMINATED") {
+    if (match !== null && Number(match[1]) <= now && pod.status !== "TERMINATED") {
       await deletePodVerified(api, pod.id, sleep);
     }
   }
@@ -258,9 +355,9 @@ const waitForConnectablePod = async (
   for (let attempt = 0; attempt < 144; attempt += 1) {
     const pod = await api.getPod(id);
     if (
-      pod.desiredStatus === "RUNNING" &&
-      pod.publicIp !== undefined &&
-      pod.portMappings?.["22"] !== undefined
+      pod.status === "RUNNING" &&
+      pod.ssh?.direct !== undefined &&
+      pod.ssh.direct !== null
     ) return pod;
     await sleep(5_000);
   }
@@ -296,7 +393,7 @@ const deletePodVerified = async (
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const pod = await api.getPod(id);
-      if (pod.desiredStatus === "TERMINATED") return;
+      if (pod.status === "TERMINATED") return;
     } catch (error) {
       if (hasStatus(error, 404)) return;
       throw error;
@@ -306,11 +403,49 @@ const deletePodVerified = async (
   throw new Error(`Runpod Pod ${id} still exists after deletion`);
 };
 
+const deletePodAndReport = async (
+  api: ReturnType<typeof createRunpodApi>,
+  id: string,
+  sleep: NonNullable<RunpodTrainerDependencies["sleep"]>,
+  lifecycle: TrainingLifecycleReporter | undefined,
+): Promise<void> => {
+  const failures: unknown[] = [];
+  try {
+    lifecycle?.recordCleanup({ status: "pending" });
+  } catch (error) {
+    failures.push(error);
+  }
+  let deletionError: unknown;
+  try {
+    await deletePodVerified(api, id, sleep);
+  } catch (error) {
+    deletionError = error;
+    failures.push(error);
+  }
+  try {
+    lifecycle?.recordCleanup(deletionError === undefined
+      ? { status: "succeeded" }
+      : {
+          status: "failed",
+          message: deletionError instanceof Error
+            ? deletionError.message
+            : String(deletionError),
+        });
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, `Could not clean up Runpod Pod ${id}`);
+  }
+};
+
 const sshArguments = (
   host: string,
   port: number,
   privateKey: string,
   knownHostsPath: string,
+  username = "root",
 ): readonly string[] => [
   "-p",
   String(port),
@@ -324,7 +459,7 @@ const sshArguments = (
   "StrictHostKeyChecking=accept-new",
   "-o",
   `UserKnownHostsFile=${knownHostsPath}`,
-  `root@${host}`,
+  `${username}@${host}`,
 ];
 
 const scpConnectionArguments = (ssh: readonly string[]): readonly string[] => {
@@ -402,6 +537,3 @@ const validateOptions = (options: RunpodTrainerOptions): void => {
 
 const hasStatus = (error: unknown, status: number): boolean =>
   typeof error === "object" && error !== null && "status" in error && error.status === status;
-
-const asError = (error: unknown): Error =>
-  error instanceof Error ? error : new Error(String(error));

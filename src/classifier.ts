@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 
 import { normalizeConfig, validateResult } from "./config.js";
 import { prepareExampleMetadata } from "./dataset-policy.js";
 import { averageError, resultError } from "./evaluation.js";
 import { SwapAIError } from "./errors.js";
+import { createShadowEvaluator } from "./shadow-evaluation.js";
 import {
   createNeedleRuntime,
   hasNeedleModelArtifacts,
@@ -29,6 +32,9 @@ const TRAINING_LEASE_DURATION_MS = 5 * 60 * 1000;
 const TRAINING_LEASE_RENEWAL_MS = 60 * 1000;
 const RUNTIME_HEARTBEAT_MS = 2_000;
 const ARTIFACT_LOCK_WAIT_MS = 30_000;
+const { DatabaseSync } = createRequire(import.meta.url)(
+  "node:sqlite",
+) as typeof import("node:sqlite");
 
 export function init<const Config extends ResultConfig>(
   inputConfig: InitConfig<Config>,
@@ -45,7 +51,7 @@ export function init<const Config extends ResultConfig>(
       ),
   });
 
-  return createClassifier(config, storage, runtime);
+  return createClassifier(config, storage, runtime, dataDirectory);
 }
 
 function openClassifierStorage<const Config extends ResultConfig>(
@@ -98,8 +104,14 @@ function createClassifier<const Config extends ResultConfig>(
   config: NormalizedInitConfig<Config>,
   storage: Storage,
   runtime: NeedleRuntime,
+  dataDirectory: string,
 ): Classifier<ResultFor<Config>> {
   type Result = ResultFor<Config>;
+  const shadow = createShadowEvaluator({
+    dataDirectory,
+    classifierName: config.name,
+    result: config.result,
+  });
 
   const initialState = storage.snapshot();
   let closed = false;
@@ -733,6 +745,20 @@ function createClassifier<const Config extends ResultConfig>(
         deletionFailures.push(error);
       }
     }
+    await shadow.reset();
+
+    const manualRuns = trainingRuns(databasePath(dataDirectory), config.name);
+    const unsafeRun = manualRuns.find(
+      (run) =>
+        run.status === "running" ||
+        run.cleanupStatus === "pending" || run.cleanupStatus === "failed",
+    );
+    if (unsafeRun !== undefined) {
+      throw new SwapAIError(
+        "storage_failed",
+        `Training run "${unsafeRun.id}" must be cleaned up before classifier erasure`,
+      );
+    }
 
     const lockWaitStarted = Date.now();
     let clearState = refreshStoredState();
@@ -781,6 +807,23 @@ function createClassifier<const Config extends ResultConfig>(
           deletionFailures.push(error);
         }
       }
+      try {
+        await Promise.all([
+          ...manualRuns.map((run) =>
+            rm(join(dataDirectory, "training-runs", run.id), {
+              recursive: true,
+              force: true,
+            }),
+          ),
+          rm(join(
+            dataDirectory,
+            "classifiers",
+            createHash("sha256").update(config.name).digest("hex"),
+          ), { recursive: true, force: true }),
+        ]);
+      } catch (error) {
+        deletionFailures.push(error);
+      }
       throwDeletionFailures();
 
       storage.finishClearTrainingData(clearEpoch);
@@ -796,10 +839,7 @@ function createClassifier<const Config extends ResultConfig>(
 
   async function flushNow(): Promise<void> {
     const clearFailureBeforeFlush = clearFailure;
-    if (
-      refreshStoredState().clearPending ||
-      config.automaticTraining !== false
-    ) {
+    if (config.automaticTraining !== false) {
       await ensureRuntimeStarted();
     }
     while (true) {
@@ -837,6 +877,7 @@ function createClassifier<const Config extends ResultConfig>(
       queuedFailure = null;
       throw failure;
     }
+    await shadow.flush();
   }
 
   const classifier: Classifier<Result> = {
@@ -851,6 +892,7 @@ function createClassifier<const Config extends ResultConfig>(
       const validResult = validateResult(config.result, result);
       const epoch = refreshStoredState().dataEpoch;
       void persistExample(input, validResult, epoch, facets);
+      shadow.observe(input, validResult);
     },
 
     clearTrainingData() {
@@ -861,10 +903,14 @@ function createClassifier<const Config extends ResultConfig>(
       const trainingBeforeClear = trainingQueue;
       const classificationsBeforeClear = classificationQueue;
       void enqueue(async () => {
-        const clearFailureBeforeStartup = clearFailure;
-        await ensureRuntimeStarted();
-        if (clearFailure !== null && clearFailure !== clearFailureBeforeStartup)
-          return;
+        if (config.automaticTraining !== false) {
+          const clearFailureBeforeStartup = clearFailure;
+          await ensureRuntimeStarted();
+          if (
+            clearFailure !== null &&
+            clearFailure !== clearFailureBeforeStartup
+          ) return;
+        }
         await trainingBeforeClear;
         await classificationsBeforeClear;
         try {
@@ -875,11 +921,21 @@ function createClassifier<const Config extends ResultConfig>(
       });
     },
 
+    async erase() {
+      assertOpen(closed || closing);
+      classifier.clearTrainingData();
+      await flushNow();
+    },
+
     classify(input, reference, facets = {}) {
       assertOpen(closed || closing);
       const epoch = refreshStoredState().dataEpoch;
       const task = classificationQueue.then(() =>
         classifyNow(input, reference, epoch, facets),
+      );
+      void task.then(
+        (result) => shadow.observe(input, result),
+        () => undefined,
       );
       classificationQueue = task.then(
         () => undefined,
@@ -917,6 +973,11 @@ function createClassifier<const Config extends ResultConfig>(
         loadedModel = null;
         loadedModelEpoch = null;
         try {
+          await shadow.close();
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
           await runtime.close();
         } catch (error) {
           failures.push(error);
@@ -944,6 +1005,50 @@ function createClassifier<const Config extends ResultConfig>(
 
   return classifier;
 }
+
+const databasePath = (dataDirectory: string): string =>
+  join(dataDirectory, "swapai.sqlite");
+
+const trainingRuns = (
+  path: string,
+  classifierName: string,
+): readonly {
+  id: string;
+  status: string;
+  providerRunId: string | null;
+  cleanupStatus: string;
+}[] => {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const columns = new Set(
+      database.prepare("PRAGMA table_info(training_runs)").all()
+        .map((value) => (value as { name: string }).name),
+    );
+    if (columns.size === 0) return [];
+    return database.prepare(`
+      SELECT id, status, provider_run_id,
+             ${columns.has("cleanup_status")
+               ? "cleanup_status"
+               : "'not_required' AS cleanup_status"}
+      FROM training_runs WHERE classifier_name = ?
+    `).all(classifierName).map((value) => {
+      const row = value as {
+        id: string;
+        status: string;
+        provider_run_id: string | null;
+        cleanup_status: string;
+      };
+      return {
+        id: row.id,
+        status: row.status,
+        providerRunId: row.provider_run_id,
+        cleanupStatus: row.cleanup_status,
+      };
+    });
+  } finally {
+    database.close();
+  }
+};
 
 function assertOpen(closed: boolean): void {
   if (closed) {

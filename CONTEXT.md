@@ -44,7 +44,8 @@ _Avoid_: Enough data
 
 **Dataset Revision**:
 An immutable snapshot of all examples used to train and test one candidate.
-Only its training and validation examples cross the Training Provider boundary.
+Only its training examples cross the Training Provider boundary. Validation,
+representative-test, and coverage-test examples stay inside the application.
 _Avoid_: Current dataset, mutable batch
 
 **Training Provider**:
@@ -69,13 +70,14 @@ Reference Classifier.
 _Avoid_: Trained model
 
 **Promotion Evidence**:
-The recorded aggregate and per-result-bin errors from both protected test
-suites. Every recorded slice must meet Acceptable Error.
+The recorded aggregate and per-result-bin errors from every protected test
+suite, plus fresh aggregate shadow evidence from live Reference Classifier
+traffic. Every recorded slice must meet Acceptable Error.
 _Avoid_: MAE, accuracy number
 
 **Promoted Classifier**:
-A Candidate Classifier whose Promotion Evidence passed and whose Dataset
-Revision was still current at the promotion transaction.
+A Candidate Classifier whose protected and fresh shadow evidence passed, whose
+Dataset Revision was still current, and which a caller explicitly promoted.
 _Avoid_: Trained, finished
 
 **Model Artifact**:

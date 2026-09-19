@@ -8,6 +8,8 @@ import type {
   ResultConfig,
   TrainingExample,
   TrainingJob,
+  TrainingCleanupStatus,
+  TrainingResource,
 } from "./types.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)(
@@ -40,9 +42,15 @@ export const createTrainingJob = (options: {
   readonly result: ResultConfig;
   readonly acceptableError: number;
   readonly providerName: string;
-}): TrainingJob => {
+}): TrainingJob | {
+  readonly existing: true;
+  readonly id: string;
+  readonly datasetRevisionId: string;
+  readonly status: "running" | "candidate" | "promoted";
+} => {
   const databasePath = join(options.dataDirectory, "swapai.sqlite");
   const database = new DatabaseSync(databasePath);
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
   database.exec("PRAGMA foreign_keys = ON");
   database.exec("PRAGMA busy_timeout = 5000");
   try {
@@ -59,24 +67,23 @@ export const createTrainingJob = (options: {
           `Classifier "${options.classifierName}" is unavailable`,
         );
       }
-      const staleBefore = Date.now() - 6 * 60 * 60 * 1_000;
-      database.prepare(`
-        UPDATE training_runs
-        SET status = 'failed',
-            failure_message = 'Training run did not finish within six hours',
-            finished_at = ?
-        WHERE classifier_name = ? AND status = 'running' AND started_at < ?
-      `).run(Date.now(), options.classifierName, staleBefore);
       const running = database.prepare(`
-        SELECT id FROM training_runs
+        SELECT id, dataset_revision_id FROM training_runs
         WHERE classifier_name = ? AND status = 'running'
+        ORDER BY started_at DESC, id DESC
         LIMIT 1
-      `).get(options.classifierName) as { id: string } | undefined;
+      `).get(options.classifierName) as {
+        id: string;
+        dataset_revision_id: string;
+      } | undefined;
       if (running !== undefined) {
-        throw new SwapAIError(
-          "service_unavailable",
-          `Classifier "${options.classifierName}" already has a running training request`,
-        );
+        database.exec("COMMIT");
+        return {
+          existing: true,
+          id: running.id,
+          datasetRevisionId: running.dataset_revision_id,
+          status: "running",
+        };
       }
 
       const rows = database.prepare(`
@@ -148,6 +155,30 @@ export const createTrainingJob = (options: {
         );
       });
 
+      const existing = database.prepare(`
+        SELECT id, status
+        FROM training_runs
+        WHERE classifier_name = ?
+          AND dataset_revision_id = ?
+          AND provider_name = ?
+          AND status IN ('running', 'candidate', 'promoted')
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      `).get(
+        options.classifierName,
+        revisionHash,
+        options.providerName,
+      ) as { id: string; status: "running" | "candidate" | "promoted" } | undefined;
+      if (existing !== undefined) {
+        database.exec("COMMIT");
+        return {
+          existing: true,
+          id: existing.id,
+          datasetRevisionId: revisionHash,
+          status: existing.status,
+        };
+      }
+
       const runId = randomUUID();
       database.prepare(`
         INSERT INTO training_runs (
@@ -178,8 +209,8 @@ export const createTrainingJob = (options: {
         acceptableError: options.acceptableError,
         examples: rows
           .filter((row): row is TrainingExampleRow & {
-            purpose: "training" | "validation";
-          } => row.purpose === "training" || row.purpose === "validation")
+            purpose: "training";
+          } => row.purpose === "training")
           .map(mapTrainingExample),
         outputDirectory,
       };
@@ -209,18 +240,22 @@ export const updateTrainingRun = (
   dataDirectory: string,
   trainingRunId: string,
   update: {
-    readonly status: "failed" | "rejected" | "promoted";
+    readonly status: "failed" | "rejected" | "candidate" | "promoted";
     readonly providerRunId?: string;
     readonly costUsd?: number;
     readonly failureMessage?: string;
   },
 ): void => {
   const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
   database.exec("PRAGMA busy_timeout = 5000");
   try {
     database.prepare(`
       UPDATE training_runs
-      SET status = ?, provider_run_id = ?, cost_usd = ?, failure_message = ?,
+      SET status = ?,
+          provider_run_id = COALESCE(?, provider_run_id),
+          cost_usd = COALESCE(?, cost_usd),
+          failure_message = ?,
           finished_at = ?
       WHERE id = ? AND status = 'running'
     `).run(
@@ -236,17 +271,52 @@ export const updateTrainingRun = (
   }
 };
 
-export interface ProtectedTestExample {
+export const recordTrainingLifecycle = (options: {
+  readonly dataDirectory: string;
+  readonly trainingRunId: string;
+  readonly providerRunId?: string;
+  readonly resources?: readonly TrainingResource[];
+  readonly cleanupStatus?: TrainingCleanupStatus;
+  readonly cleanupMessage?: string | null;
+}): void => {
+  const database = new DatabaseSync(join(options.dataDirectory, "swapai.sqlite"));
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
+  database.exec("PRAGMA busy_timeout = 5000");
+  try {
+    database.prepare(`
+      UPDATE training_runs
+      SET provider_run_id = COALESCE(?, provider_run_id),
+          resources_json = COALESCE(?, resources_json),
+          cleanup_status = COALESCE(?, cleanup_status),
+          cleanup_message = CASE
+            WHEN ? IS NULL THEN cleanup_message
+            ELSE ?
+          END
+      WHERE id = ?
+    `).run(
+      options.providerRunId ?? null,
+      options.resources === undefined ? null : JSON.stringify(options.resources),
+      options.cleanupStatus ?? null,
+      options.cleanupMessage === undefined ? null : 1,
+      options.cleanupMessage ?? null,
+      options.trainingRunId,
+    );
+  } finally {
+    database.close();
+  }
+};
+
+export interface CandidateEvaluationExample {
   readonly input: string;
   readonly result: TrainingExample["result"];
   readonly resultBin: string;
-  readonly purpose: "representative_test" | "coverage_test";
+  readonly purpose: "validation" | "representative_test" | "coverage_test";
 }
 
-export const readProtectedTestExamples = (
+export const readCandidateEvaluationExamples = (
   dataDirectory: string,
   datasetRevisionId: string,
-): readonly ProtectedTestExample[] => {
+): readonly CandidateEvaluationExample[] => {
   const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
     readOnly: true,
   });
@@ -256,14 +326,14 @@ export const readProtectedTestExamples = (
       SELECT input, result_json, result_bin, purpose, facets_json, input_hash, 0 AS id
       FROM dataset_revision_examples
       WHERE dataset_revision_id = ?
-        AND purpose IN ('representative_test', 'coverage_test')
+        AND purpose IN ('validation', 'representative_test', 'coverage_test')
       ORDER BY position
     `).all(datasetRevisionId) as unknown as TrainingExampleRow[];
     return rows.map((row) => ({
       input: row.input,
       result: JSON.parse(row.result_json) as TrainingExample["result"],
       resultBin: row.result_bin,
-      purpose: row.purpose as ProtectedTestExample["purpose"],
+      purpose: row.purpose as CandidateEvaluationExample["purpose"],
     }));
   } finally {
     database.close();
@@ -271,7 +341,7 @@ export const readProtectedTestExamples = (
 };
 
 const mapTrainingExample = (
-  row: TrainingExampleRow & { purpose: "training" | "validation" },
+  row: TrainingExampleRow & { purpose: "training" },
 ): TrainingExample => ({
   input: row.input,
   result: JSON.parse(row.result_json) as TrainingExample["result"],
