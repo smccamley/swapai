@@ -49,9 +49,9 @@ if (inspection.readyForTraining) {
   if (request.status === "candidate") {
     // After normal traffic has called classify(), wait for its shadow writes.
     await relevance.flush();
-    const run = relevance.inspect().trainingRuns.find(
-      ({ id }) => id === request.trainingRunId,
-    );
+    const run = relevance
+      .inspect()
+      .trainingRuns.find(({ id }) => id === request.trainingRunId);
 
     if (run?.shadow?.passed) {
       await relevance.promoteCandidate(request.trainingRunId);
@@ -87,26 +87,41 @@ Each unique input has a stable purpose based only on classifier name and input:
 
 Providers receive only training examples. All three evaluation sets remain
 local, so a provider cannot inspect or train against its acceptance exam.
+Readiness always requires at least one validation, representative-test, and
+coverage-test example, even when configurable per-bin minima are zero;
+`requestTraining()` returns `not_ready` before contacting a provider when any
+protected suite is empty.
 Numeric results are binned around declared decision boundaries. Boolean and
 string results use one bin per allowed value. `inspect()` reports result-bin
 coverage, declared-facet groups (including unlabelled examples), readiness
-deficits, complete run history, provider resources, cleanup state, protected
-metrics, cost, artifacts, and shadow evidence.
+deficits, the newest 100 training runs, provider resources, cleanup state,
+protected metrics, cost, artifacts, and shadow evidence.
+
+On the first 0.6 configured open of never-trained legacy data, SwapAI repairs
+the earlier 0.5 two-purpose adoption and assigns all four purposes
+deterministically so existing observations can satisfy modern readiness. If
+any local attempt, provider run, model artifact, or earlier generation exists,
+legacy trainer-visible rows stay non-protected and cannot become validation or
+test evidence.
 
 When `maxTrainingSet` is reached, retention balances result bin, purpose, and
 facet groups rather than keeping only recent majority traffic.
 
 ## Runpod
 
-`runpodTrainer()` uses Runpod REST API v2. It creates one Secure Pod by default,
-enforces the declared time and cost ceilings, records the Pod ID immediately,
-and verifies termination on success and failure. `reconcileTraining()` checks
-durable running records after a controller restart and terminates expired Pods.
-The paid training deadline reserves five minutes for verified deletion inside
-the earlier of the runtime and cost limits.
+`runpodTrainer()` uses Runpod REST API v2 and Secure Cloud only. It accepts the
+API's proxy or direct SSH connection, requires a CUDA 12.8-or-newer host, and
+creates one Pod after documented per-GPU placement retries. HTTP requests and
+child processes are abortable; terminal Pod states fail immediately. Recovery
+walks every API page, records the Pod ID immediately, and verifies termination
+on success and failure. `reconcileTraining()` checks durable running records
+after a controller restart and terminates expired Pods. The paid training
+deadline includes both reported compute and conservatively priced container
+storage, and reserves five minutes for verified deletion inside the earlier of
+the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.5.0`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.0`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 

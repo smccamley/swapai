@@ -47,7 +47,9 @@ Validation and protected tests remain outside the trainer so a training
 implementation cannot accidentally tune against its promotion exam. Aggregate error alone is
 insufficient: an imbalanced relevance dataset can make a constant low score
 look accurate. Promotion therefore requires every protected suite and result
-bin to pass. The provider receives training examples only. A candidate that
+bin to pass. Readiness requires every protected suite to be non-empty, even
+when configurable per-bin minima are zero, so a guaranteed rejection cannot
+incur provider cost. The provider receives training examples only. A candidate that
 passes frozen evidence remains non-authoritative until fresh reference-backed
 shadow evidence passes and the caller explicitly promotes its run ID.
 
@@ -55,6 +57,13 @@ The trainer boundary is a versioned on-disk protocol. Input and output files
 are SHA-256 verified on both sides. Local and Runpod providers execute the same
 contract, so infrastructure choice cannot change what a trainer is allowed to
 see or return.
+
+The Runpod adapter is Secure-Cloud-only because Community Cloud cannot
+guarantee the SSH route this protocol needs. It supports both Runpod proxy SSH
+and direct SSH, constrains placement to CUDA 12.8 or newer, aborts bounded HTTP
+and child-process work, and follows every list page during orphan recovery.
+Its paid deadline includes reported compute, conservative container-storage
+cost, and deletion headroom.
 
 The project uses one npm package with explicit subpath imports instead of four
 packages. This keeps installation to one dependency while retaining the same
