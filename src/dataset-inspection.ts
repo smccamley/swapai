@@ -3,10 +3,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 
 import { validateResult } from "./config.js";
-import {
-  prepareExampleMetadata,
-  resultBins,
-} from "./dataset-policy.js";
+import { prepareExampleMetadata, resultBins } from "./dataset-policy.js";
 import type {
   ClassifierInspection,
   DatasetDeficit,
@@ -66,36 +63,55 @@ export const readClassifierInspection = (options: {
   const database = new DatabaseSync(databasePath, { readOnly: true });
   try {
     database.exec("PRAGMA busy_timeout = 5000");
-    const classifier = database.prepare(`
+    const classifier = database
+      .prepare(
+        `
       SELECT active_generation, total_examples_logged
       FROM classifiers
       WHERE name = ?
-    `).get(options.name) as
+    `,
+      )
+      .get(options.name) as
       | { active_generation: number; total_examples_logged: number }
       | undefined;
     if (classifier === undefined) {
       return inspectionFromCounts(options.name, bins, options.policy, 0, []);
     }
     const exampleColumns = tableColumns(database, "examples");
-    const counts = exampleColumns.has("result_bin") && exampleColumns.has("purpose")
-      ? database.prepare(`
+    const counts =
+      exampleColumns.has("result_bin") && exampleColumns.has("purpose")
+        ? (database
+            .prepare(
+              `
           SELECT result_bin, purpose, COUNT(*) AS example_count
           FROM examples
           WHERE classifier_name = ?
             AND generation = ?
             AND purpose != 'legacy_seen'
           GROUP BY result_bin, purpose
-        `).all(options.name, classifier.active_generation) as unknown as CountRow[]
-      : legacyExampleCounts(database, options, classifier.active_generation);
-    const facetCounts: FacetCountRow[] = exampleColumns.has("facets_json") &&
-        exampleColumns.has("purpose")
-      ? database.prepare(`
+        `,
+            )
+            .all(
+              options.name,
+              classifier.active_generation,
+            ) as unknown as CountRow[])
+        : legacyExampleCounts(database, options, classifier.active_generation);
+    const facetCounts: FacetCountRow[] =
+      exampleColumns.has("facets_json") && exampleColumns.has("purpose")
+        ? (database
+            .prepare(
+              `
           SELECT facets_json, purpose, COUNT(*) AS example_count
           FROM examples
           WHERE classifier_name = ? AND generation = ? AND purpose != 'legacy_seen'
           GROUP BY facets_json, purpose
-        `).all(options.name, classifier.active_generation) as unknown as FacetCountRow[]
-      : counts.map((count) => ({ facets_json: "{}", ...count }));
+        `,
+            )
+            .all(
+              options.name,
+              classifier.active_generation,
+            ) as unknown as FacetCountRow[])
+        : counts.map((count) => ({ facets_json: "{}", ...count }));
     const trainingRuns = hasTable(database, "training_runs")
       ? readTrainingRuns(database, options.name, options.acceptableError)
       : [];
@@ -151,11 +167,14 @@ const inspectionFromCounts = (
   });
 
   const deficits: DatasetDeficit[] = [];
-  const facetGroups = new Map<string, {
-    facet: string;
-    value: string | null;
-    purposes: ReturnType<typeof emptyPurposes>;
-  }>();
+  const facetGroups = new Map<
+    string,
+    {
+      facet: string;
+      value: string | null;
+      purposes: ReturnType<typeof emptyPurposes>;
+    }
+  >();
   for (const facet of policy.facets) {
     facetGroups.set(`${facet}\0`, {
       facet,
@@ -186,6 +205,14 @@ const inspectionFromCounts = (
     (sum, bin) => sum + bin.purposes.representative_test,
     0,
   );
+  const validationTotal = resultBinInspections.reduce(
+    (sum, bin) => sum + bin.purposes.validation,
+    0,
+  );
+  const coverageTotal = resultBinInspections.reduce(
+    (sum, bin) => sum + bin.purposes.coverage_test,
+    0,
+  );
   addDeficit(
     deficits,
     "training",
@@ -193,13 +220,15 @@ const inspectionFromCounts = (
     policy.requirements.minimumTrainingExamples,
     trainingTotal,
   );
+  addDeficit(deficits, "validation", null, 1, validationTotal);
   addDeficit(
     deficits,
     "representative_test",
     null,
-    policy.requirements.minimumRepresentativeTestExamples,
+    Math.max(1, policy.requirements.minimumRepresentativeTestExamples),
     representativeTotal,
   );
+  addDeficit(deficits, "coverage_test", null, 1, coverageTotal);
   for (const bin of resultBinInspections) {
     addDeficit(
       deficits,
@@ -234,9 +263,10 @@ const inspectionFromCounts = (
     readyForTraining: deficits.length === 0,
     resultBins: resultBinInspections,
     facetCoverage: [...facetGroups.values()]
-      .sort((left, right) =>
-        left.facet.localeCompare(right.facet) ||
-        (left.value ?? "").localeCompare(right.value ?? ""),
+      .sort(
+        (left, right) =>
+          left.facet.localeCompare(right.facet) ||
+          (left.value ?? "").localeCompare(right.value ?? ""),
       )
       .map((group) => ({
         ...group,
@@ -264,33 +294,47 @@ const inspectionFromCounts = (
 const hasTable = (
   database: InstanceType<typeof DatabaseSync>,
   name: string,
-): boolean => database.prepare(`
+): boolean =>
+  database
+    .prepare(
+      `
   SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
-`).get(name) !== undefined;
+`,
+    )
+    .get(name) !== undefined;
 
 const tableColumns = (
   database: InstanceType<typeof DatabaseSync>,
   table: string,
-): Set<string> => new Set(
-  database.prepare(`PRAGMA table_info(${table})`).all().map(
-    (value) => (value as { name: string }).name,
-  ),
-);
+): Set<string> =>
+  new Set(
+    database
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((value) => (value as { name: string }).name),
+  );
 
 const legacyExampleCounts = (
   database: InstanceType<typeof DatabaseSync>,
   options: Parameters<typeof readClassifierInspection>[0],
   generation: number,
 ): CountRow[] => {
-  const examples = database.prepare(`
+  const examples = database
+    .prepare(
+      `
     SELECT input, result_json, split
     FROM examples
     WHERE classifier_name = ? AND generation = ?
     ORDER BY id
-  `).all(options.name, generation) as unknown as LegacyExampleRow[];
+  `,
+    )
+    .all(options.name, generation) as unknown as LegacyExampleRow[];
   const counts = new Map<string, CountRow>();
   for (const example of examples) {
-    const result = validateResult(options.result, JSON.parse(example.result_json));
+    const result = validateResult(
+      options.result,
+      JSON.parse(example.result_json),
+    );
     const metadata = prepareExampleMetadata(
       options.name,
       options.result,
@@ -317,7 +361,9 @@ const readTrainingRuns = (
   acceptableError: number,
 ): readonly TrainingRunInspection[] => {
   const columns = tableColumns(database, "training_runs");
-  const rows = database.prepare(`
+  const rows = database
+    .prepare(
+      `
     SELECT id, dataset_revision_id, provider_name, status,
            provider_run_id, cost_usd, artifact_sha256, failure_message,
            ${columns.has("resources_json") ? "resources_json" : "'[]' AS resources_json"},
@@ -327,7 +373,9 @@ const readTrainingRuns = (
     FROM training_runs
     WHERE classifier_name = ?
     ORDER BY started_at DESC, id DESC
-  `).all(classifierName);
+  `,
+    )
+    .all(classifierName);
   const evaluations = hasTable(database, "training_evaluations")
     ? database.prepare(`
         SELECT purpose, result_bin, example_count, error, passed
@@ -343,12 +391,14 @@ const readTrainingRuns = (
         FROM shadow_evaluations WHERE training_run_id = ?
       `)
     : null;
-  return rows.map((value) => mapTrainingRun(
-    value,
-    evaluations?.all((value as { id: string }).id) ?? [],
-    shadows?.get((value as { id: string }).id),
-    acceptableError,
-  ));
+  return rows.map((value) =>
+    mapTrainingRun(
+      value,
+      evaluations?.all((value as { id: string }).id) ?? [],
+      shadows?.get((value as { id: string }).id),
+      acceptableError,
+    ),
+  );
 };
 
 const mapTrainingRun = (
@@ -372,16 +422,19 @@ const mapTrainingRun = (
     started_at: number;
     finished_at: number | null;
   };
-  const shadow = shadowValue as {
-    example_count: number;
-    total_error: number;
-    failure_count: number;
-    last_failure_message: string | null;
-    last_evaluated_at: number | null;
-  } | undefined;
-  const meanError = shadow === undefined || shadow.example_count === 0
-    ? null
-    : shadow.total_error / shadow.example_count;
+  const shadow = shadowValue as
+    | {
+        example_count: number;
+        total_error: number;
+        failure_count: number;
+        last_failure_message: string | null;
+        last_evaluated_at: number | null;
+      }
+    | undefined;
+  const meanError =
+    shadow === undefined || shadow.example_count === 0
+      ? null
+      : shadow.total_error / shadow.example_count;
   return {
     id: row.id,
     datasetRevisionId: row.dataset_revision_id,
@@ -391,7 +444,9 @@ const mapTrainingRun = (
     costUsd: row.cost_usd,
     artifactSha256: row.artifact_sha256,
     failureMessage: row.failure_message,
-    resources: JSON.parse(row.resources_json) as TrainingRunInspection["resources"],
+    resources: JSON.parse(
+      row.resources_json,
+    ) as TrainingRunInspection["resources"],
     cleanup: {
       status: row.cleanup_status,
       message: row.cleanup_message,
@@ -412,19 +467,20 @@ const mapTrainingRun = (
         passed: metric.passed === 1,
       };
     }),
-    shadow: shadow === undefined
-      ? null
-      : {
-          exampleCount: shadow.example_count,
-          meanError,
-          passed:
-            meanError !== null &&
-            meanError <= acceptableError &&
-            shadow.failure_count === 0,
-          failureCount: shadow.failure_count,
-          lastFailureMessage: shadow.last_failure_message,
-          lastEvaluatedAt: shadow.last_evaluated_at,
-        },
+    shadow:
+      shadow === undefined
+        ? null
+        : {
+            exampleCount: shadow.example_count,
+            meanError,
+            passed:
+              meanError !== null &&
+              meanError <= acceptableError &&
+              shadow.failure_count === 0,
+            failureCount: shadow.failure_count,
+            lastFailureMessage: shadow.last_failure_message,
+            lastEvaluatedAt: shadow.last_evaluated_at,
+          },
     startedAt: row.started_at,
     finishedAt: row.finished_at,
   };

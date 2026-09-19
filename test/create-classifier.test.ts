@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -82,9 +83,15 @@ describe("createClassifier", () => {
       readOnly: true,
     });
     try {
-      expect(database.prepare(`
+      expect(
+        database
+          .prepare(
+            `
         SELECT COUNT(*) AS count FROM classifiers WHERE name = ?
-      `).get(name)).toEqual({ count: 1 });
+      `,
+          )
+          .get(name),
+      ).toEqual({ count: 1 });
     } finally {
       database.close();
     }
@@ -141,21 +148,33 @@ describe("createClassifier", () => {
       retestRevertOn: 3,
       model: "needle2",
     });
-    database.prepare(`
+    database
+      .prepare(
+        `
       INSERT INTO classifiers (
         name, config_json, max_training_set, total_examples_logged,
         new_examples_since_training, created_at, updated_at
       ) VALUES (?, ?, 10000, 1, 1, ?, ?)
-    `).run("accountant-relevance", config, now, now);
-    database.prepare(`
+    `,
+      )
+      .run("accountant-relevance", config, now, now);
+    database
+      .prepare(
+        `
       INSERT INTO generations (classifier_name, generation, status, created_at)
       VALUES (?, 1, 'active', ?)
-    `).run("accountant-relevance", now);
-    database.prepare(`
+    `,
+      )
+      .run("accountant-relevance", now);
+    database
+      .prepare(
+        `
       INSERT INTO examples (
         classifier_name, generation, input, result_json, split, created_at
       ) VALUES (?, 1, ?, ?, 'training', ?)
-    `).run("accountant-relevance", "historic invoice", "0.92", now);
+    `,
+      )
+      .run("accountant-relevance", "historic invoice", "0.92", now);
     database.close();
 
     const relevance = createClassifier({
@@ -184,11 +203,14 @@ describe("createClassifier", () => {
       automaticTraining: false,
       dataDirectory,
     });
-    legacy.logClassification("historic relevant invoice", 0.92);
-    legacy.logClassification("historic irrelevant newsletter", 0.08);
-    legacy.logClassification("historic boundary high", 0.51);
-    legacy.logClassification("historic boundary low", 0.49);
+    for (let index = 0; index < 1_319; index += 1) {
+      legacy.logClassification(
+        `historic-example-${index}`,
+        index % 2 === 0 ? 0.92 : 0.08,
+      );
+    }
     await legacy.close();
+    mimicVersion050LegacyAdoption(dataDirectory, "accountant-relevance");
 
     const relevance = createClassifier({
       name: "accountant-relevance",
@@ -199,18 +221,140 @@ describe("createClassifier", () => {
     });
 
     const inspection = relevance.inspect();
-    expect(
-      inspection.examplesByPurpose.training +
-        inspection.examplesByPurpose.validation,
-    ).toBe(4);
-    expect(inspection.examplesByPurpose.representative_test).toBe(0);
-    expect(inspection.examplesByPurpose.coverage_test).toBe(0);
+    expect(inspection.examplesByPurpose).toEqual({
+      training: 819,
+      validation: 197,
+      representative_test: 141,
+      coverage_test: 162,
+    });
     expect(
       inspection.resultBins.reduce((total, bin) => total + bin.total, 0),
-    ).toBe(4);
+    ).toBe(1_319);
 
     await expect(relevance.close()).resolves.toBeUndefined();
-  });
+
+    const reopened = createClassifier({
+      name: "accountant-relevance",
+      result: { type: "number", min: 0, max: 1 },
+      reference: async () => 0.8,
+      decisionBoundaries: [0.5],
+      dataDirectory,
+    });
+    expect(reopened.inspect().examplesByPurpose).toEqual(
+      inspection.examplesByPurpose,
+    );
+    await reopened.close();
+  }, 15_000);
+
+  it.each([
+    "local attempt",
+    "provider run",
+    "model artifact",
+    "trained generation",
+  ] as const)(
+    "does not turn legacy examples exposed by a %s into protected evidence",
+    async (evidence) => {
+      const dataDirectory = makeDirectory();
+      const legacy = init({
+        name: "previously-trained",
+        result: { type: "boolean" },
+        retrainOnCount: 50,
+        acceptableError: "10%",
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+        maxTrainingSet: 10_000,
+        automaticTraining: false,
+        dataDirectory,
+      });
+      for (let index = 0; index < 200; index += 1) {
+        legacy.logClassification(`historic-example-${index}`, index % 2 === 0);
+      }
+      await legacy.close();
+      mimicVersion050LegacyAdoption(dataDirectory, "previously-trained");
+
+      const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+      database.function(
+        "swapai_writer_version",
+        { deterministic: true },
+        () => 3,
+      );
+      if (evidence === "local attempt") {
+        database
+          .prepare(
+            "UPDATE classifiers SET training_attempts = 1 WHERE name = ?",
+          )
+          .run("previously-trained");
+      } else if (evidence === "provider run") {
+        database
+          .prepare(
+            `
+          INSERT INTO dataset_revisions (
+            id, classifier_name, generation, data_epoch, created_at
+          ) VALUES ('historic-revision', 'previously-trained', 1, 0, ?)
+        `,
+          )
+          .run(Date.now());
+        database
+          .prepare(
+            `
+          INSERT INTO training_runs (
+            id, dataset_revision_id, classifier_name, provider_name, status,
+            cleanup_status, started_at, finished_at
+          ) VALUES (
+            'historic-run', 'historic-revision', 'previously-trained',
+            'historic-provider', 'failed', 'succeeded', ?, ?
+          )
+        `,
+          )
+          .run(Date.now(), Date.now());
+      } else if (evidence === "model artifact") {
+        database
+          .prepare(
+            `
+          INSERT INTO model_artifacts (
+            classifier_name, sha256, model_path, needle_version,
+            size_bytes, created_at
+          ) VALUES (
+            'previously-trained', 'historic-sha', '/historic/model.cact',
+            '2.0.14', 1, ?
+          )
+        `,
+          )
+          .run(Date.now());
+      } else {
+        database
+          .prepare(
+            `
+          UPDATE generations
+          SET trained = 1,
+              model_path = '/historic/model.cact',
+              needle_version = '2.0.14'
+          WHERE classifier_name = 'previously-trained' AND generation = 1
+        `,
+          )
+          .run();
+      }
+      database.close();
+
+      const classifier = createClassifier({
+        name: "previously-trained",
+        result: { type: "boolean" },
+        reference: async () => true,
+        dataDirectory,
+      });
+
+      expect(classifier.inspect().examplesByPurpose).toMatchObject({
+        representative_test: 0,
+        coverage_test: 0,
+      });
+      expect(
+        classifier.inspect().examplesByPurpose.training +
+          classifier.inspect().examplesByPurpose.validation,
+      ).toBe(200);
+      await classifier.close();
+    },
+  );
 
   it("needs only a classifier definition and reference function", async () => {
     const reference = vi.fn(async (input: string) => input.includes("invoice"));
@@ -370,10 +514,12 @@ describe("createClassifier", () => {
     await relevance.flush();
 
     const coverage = relevance.inspect().facetCoverage;
-    expect(coverage.find((group) => group.value === "invoice")?.total)
-      .toBeGreaterThan(0);
-    expect(coverage.find((group) => group.value === "newsletter")?.total)
-      .toBeGreaterThan(0);
+    expect(
+      coverage.find((group) => group.value === "invoice")?.total,
+    ).toBeGreaterThan(0);
+    expect(
+      coverage.find((group) => group.value === "newsletter")?.total,
+    ).toBeGreaterThan(0);
     await relevance.close();
   });
 
@@ -431,11 +577,76 @@ describe("createClassifier", () => {
     relevance.logClassification("unknown", false);
     await relevance.flush();
 
-    expect(relevance.inspect().facetCoverage).toEqual(expect.arrayContaining([
-      expect.objectContaining({ facet: "documentFamily", value: null, total: 1 }),
-      expect.objectContaining({ facet: "documentFamily", value: "invoice", total: 1 }),
-      expect.objectContaining({ facet: "documentFamily", value: "newsletter", total: 1 }),
-    ]));
+    expect(relevance.inspect().facetCoverage).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          facet: "documentFamily",
+          value: null,
+          total: 1,
+        }),
+        expect.objectContaining({
+          facet: "documentFamily",
+          value: "invoice",
+          total: 1,
+        }),
+        expect.objectContaining({
+          facet: "documentFamily",
+          value: "newsletter",
+          total: 1,
+        }),
+      ]),
+    );
+    await relevance.close();
+  });
+
+  it("does not spend when any protected evaluation suite is empty", async () => {
+    const train = vi.fn(async (_job: TrainingJob) => {
+      throw new Error("training must not start");
+    });
+    const relevance = createClassifier({
+      name: "empty-protected-suites",
+      result: { type: "boolean" },
+      reference: async () => true,
+      training: { name: "must-not-run", train },
+      dataDirectory: makeDirectory(),
+      datasetRequirements: {
+        minimumTrainingExamples: 0,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 0,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+    });
+    relevance.logClassification("training-example-1", true);
+    await relevance.flush();
+
+    expect(relevance.inspect()).toMatchObject({
+      readyForTraining: false,
+      deficits: expect.arrayContaining([
+        {
+          purpose: "validation",
+          resultBin: null,
+          required: 1,
+          available: 0,
+        },
+        {
+          purpose: "representative_test",
+          resultBin: null,
+          required: 1,
+          available: 0,
+        },
+        {
+          purpose: "coverage_test",
+          resultBin: null,
+          required: 1,
+          available: 0,
+        },
+      ]),
+    });
+    await expect(relevance.requestTraining()).resolves.toMatchObject({
+      status: "not_ready",
+    });
+    expect(train).not.toHaveBeenCalled();
     await relevance.close();
   });
 
@@ -487,8 +698,7 @@ describe("createClassifier", () => {
     expect(receivedJobs[0]!.examples.length).toBeGreaterThan(0);
     expect(
       receivedJobs[0]!.examples.every(
-        (example) =>
-          example.purpose === "training",
+        (example) => example.purpose === "training",
       ),
     ).toBe(true);
     expect(
@@ -557,9 +767,39 @@ describe("createClassifier", () => {
       trainingRunId: failedRun.id,
     });
     expect(attempts).toHaveLength(1);
-    await expect(relevance.retryTraining(failedRun.id)).rejects.toBe(trainingFailure);
+    await expect(relevance.retryTraining(failedRun.id)).rejects.toBe(
+      trainingFailure,
+    );
     expect(attempts).toHaveLength(2);
     expect(attempts[1]!.id).not.toBe(failedRun.id);
     await relevance.close();
   });
 });
+
+const mimicVersion050LegacyAdoption = (
+  dataDirectory: string,
+  classifierName: string,
+): void => {
+  const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
+  database.function("test_input_hash", { deterministic: true }, (input) =>
+    createHash("sha256").update(String(input)).digest("hex"),
+  );
+  database
+    .prepare(
+      `
+      UPDATE examples
+      SET input_hash = test_input_hash(input),
+          result_bin = CASE result_json WHEN 'true' THEN 'true'
+            WHEN 'false' THEN 'false'
+            ELSE CASE WHEN CAST(result_json AS REAL) < 0.5
+              THEN '0..0.2' ELSE '0.8..1' END
+          END,
+          purpose = CASE split WHEN 'training' THEN 'training'
+            ELSE 'validation' END
+      WHERE classifier_name = ?
+    `,
+    )
+    .run(classifierName);
+  database.close();
+};

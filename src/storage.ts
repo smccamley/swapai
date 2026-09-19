@@ -256,6 +256,12 @@ const SCHEMA = `
     ON examples(classifier_name, generation, input_hash)
     WHERE input_hash != '';
 
+  CREATE TABLE IF NOT EXISTS legacy_dataset_purpose_adoptions (
+    classifier_name TEXT PRIMARY KEY,
+    adopted_at INTEGER NOT NULL,
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS classifier_runtimes (
     classifier_name TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
@@ -1320,14 +1326,27 @@ function adoptLegacyExamples(
     result: StoredResult,
   ) => PreparedExampleMetadata,
 ): void {
+  const mayUseProtectedPurposes = legacyExamplesWereNeverExposedToTraining(
+    database,
+    name,
+  );
+  const repairPreviouslyAdoptedPurposes =
+    mayUseProtectedPurposes &&
+    database
+      .prepare(
+        `
+        SELECT 1 FROM legacy_dataset_purpose_adoptions
+        WHERE classifier_name = ?
+      `,
+      )
+      .get(name) === undefined;
   const examples = database
     .prepare(
       `
-      SELECT id, input, result_json, split
+      SELECT id, input, result_json, split, purpose
       FROM examples
       WHERE classifier_name = ?
         AND generation = ?
-        AND purpose = 'legacy_seen'
       ORDER BY id
     `,
     )
@@ -1338,6 +1357,7 @@ function adoptLegacyExamples(
         input: string;
         result_json: string;
         split: ExampleSplit;
+        purpose: DatasetPurpose;
       }>(value),
     );
   const update = database.prepare(`
@@ -1348,7 +1368,29 @@ function adoptLegacyExamples(
       AND generation = ?
       AND purpose = 'legacy_seen'
   `);
+  const updateAdoptedPurpose = database.prepare(`
+    UPDATE examples
+    SET purpose = ?
+    WHERE id = ?
+      AND classifier_name = ?
+      AND generation = ?
+  `);
   for (const example of examples) {
+    if (example.purpose !== "legacy_seen") {
+      if (repairPreviouslyAdoptedPurposes) {
+        const metadata = prepareMetadata(
+          example.input,
+          JSON.parse(example.result_json) as StoredResult,
+        );
+        updateAdoptedPurpose.run(
+          metadata.purpose,
+          example.id,
+          name,
+          generation,
+        );
+      }
+      continue;
+    }
     const metadata = prepareMetadata(
       example.input,
       JSON.parse(example.result_json) as StoredResult,
@@ -1356,13 +1398,82 @@ function adoptLegacyExamples(
     update.run(
       metadata.inputHash,
       metadata.resultBin,
-      example.split === "training" ? "training" : "validation",
+      mayUseProtectedPurposes
+        ? metadata.purpose
+        : example.split === "training"
+          ? "training"
+          : "validation",
       stringifyJson(metadata.facets, "classification facets"),
       example.id,
       name,
       generation,
     );
   }
+  database
+    .prepare(
+      `
+      INSERT OR IGNORE INTO legacy_dataset_purpose_adoptions (
+        classifier_name, adopted_at
+      ) VALUES (?, ?)
+    `,
+    )
+    .run(name, Date.now());
+}
+
+function legacyExamplesWereNeverExposedToTraining(
+  database: DatabaseSyncType,
+  name: string,
+): boolean {
+  const evidence = requiredRow<{
+    training_attempts: number;
+    examples_used_for_training: number;
+    previous_generation_count: number;
+    trained_generation_count: number;
+    training_run_count: number;
+    artifact_count: number;
+  }>(
+    database
+      .prepare(
+        `
+        SELECT
+          c.training_attempts,
+          c.examples_used_for_training,
+          (
+            SELECT COUNT(*) FROM generations g
+            WHERE g.classifier_name = c.name
+              AND g.generation <> c.active_generation
+          ) AS previous_generation_count,
+          (
+            SELECT COUNT(*) FROM generations g
+            WHERE g.classifier_name = c.name
+              AND (
+                g.trained <> 0
+                OR g.model_path IS NOT NULL
+                OR g.needle_version IS NOT NULL
+              )
+          ) AS trained_generation_count,
+          (
+            SELECT COUNT(*) FROM training_runs r
+            WHERE r.classifier_name = c.name
+          ) AS training_run_count,
+          (
+            SELECT COUNT(*) FROM model_artifacts a
+            WHERE a.classifier_name = c.name
+          ) AS artifact_count
+        FROM classifiers c
+        WHERE c.name = ?
+      `,
+      )
+      .get(name),
+  );
+  return (
+    evidence.training_attempts === 0 &&
+    evidence.examples_used_for_training === 0 &&
+    evidence.previous_generation_count === 0 &&
+    evidence.trained_generation_count === 0 &&
+    evidence.training_run_count === 0 &&
+    evidence.artifact_count === 0
+  );
 }
 
 function activeGeneration(database: DatabaseSyncType, name: string): number {
@@ -1445,16 +1556,23 @@ function migrateExistingTablesBeforeCurrentSchema(
 }
 
 function migrateTrainingRunStatus(database: DatabaseSyncType): void {
-  const definition = database.prepare(`
+  const definition = database
+    .prepare(
+      `
     SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'training_runs'
-  `).get() as { sql: string } | undefined;
-  if (definition === undefined || definition.sql.includes("'candidate'")) return;
+  `,
+    )
+    .get() as { sql: string } | undefined;
+  if (definition === undefined || definition.sql.includes("'candidate'"))
+    return;
 
   database.exec("PRAGMA foreign_keys = OFF");
   try {
     transaction(database, () => {
       database.exec("PRAGMA legacy_alter_table = ON");
-      database.exec("ALTER TABLE training_runs RENAME TO training_runs_before_candidates");
+      database.exec(
+        "ALTER TABLE training_runs RENAME TO training_runs_before_candidates",
+      );
       database.exec(`
         CREATE TABLE training_runs (
           id TEXT PRIMARY KEY,
@@ -1502,10 +1620,14 @@ function migrateTrainingRunColumns(database: DatabaseSyncType): void {
       .map((value) => row<{ name: string }>(value).name),
   );
   if (!columns.has("resources_json")) {
-    database.exec("ALTER TABLE training_runs ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'");
+    database.exec(
+      "ALTER TABLE training_runs ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'",
+    );
   }
   if (!columns.has("cleanup_status")) {
-    database.exec("ALTER TABLE training_runs ADD COLUMN cleanup_status TEXT NOT NULL DEFAULT 'not_required'");
+    database.exec(
+      "ALTER TABLE training_runs ADD COLUMN cleanup_status TEXT NOT NULL DEFAULT 'not_required'",
+    );
   }
   if (!columns.has("cleanup_message")) {
     database.exec("ALTER TABLE training_runs ADD COLUMN cleanup_message TEXT");
@@ -1513,13 +1635,20 @@ function migrateTrainingRunColumns(database: DatabaseSyncType): void {
 }
 
 function migrateTrainingEvaluationPurpose(database: DatabaseSyncType): void {
-  const definition = database.prepare(`
+  const definition = database
+    .prepare(
+      `
     SELECT sql FROM sqlite_master
     WHERE type = 'table' AND name = 'training_evaluations'
-  `).get() as { sql: string } | undefined;
-  if (definition === undefined || definition.sql.includes("'validation'")) return;
+  `,
+    )
+    .get() as { sql: string } | undefined;
+  if (definition === undefined || definition.sql.includes("'validation'"))
+    return;
   transaction(database, () => {
-    database.exec("ALTER TABLE training_evaluations RENAME TO training_evaluations_before_validation");
+    database.exec(
+      "ALTER TABLE training_evaluations RENAME TO training_evaluations_before_validation",
+    );
     database.exec(`
       CREATE TABLE training_evaluations (
         training_run_id TEXT NOT NULL,
