@@ -105,6 +105,12 @@ export function normalizeConfig<const Config extends ResultConfig>(
   ) {
     invalidConfiguration("onBackgroundError must be a function");
   }
+  if (
+    config.automaticTraining !== undefined &&
+    typeof config.automaticTraining !== "boolean"
+  ) {
+    invalidConfiguration("automaticTraining must be a boolean");
+  }
 
   return {
     ...config,

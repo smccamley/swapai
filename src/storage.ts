@@ -4,6 +4,9 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 
+import type { PreparedExampleMetadata } from "./dataset-policy.js";
+import type { ClassificationFacets, DatasetPurpose } from "./types.js";
+
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
 export type StoredResult = number | boolean | string;
@@ -23,6 +26,10 @@ export interface StoredExample {
   input: string;
   result: StoredResult;
   split: ExampleSplit;
+  inputHash: string;
+  resultBin: string;
+  purpose: DatasetPurpose;
+  facets: ClassificationFacets<string>;
   createdAt: number;
 }
 
@@ -86,6 +93,7 @@ export interface Storage {
     input: string,
     result: StoredResult,
     expectedDataEpoch?: number,
+    metadata?: PreparedExampleMetadata,
   ): StoredExample | null;
   listExamples(split?: ExampleSplit, generation?: number): StoredExample[];
   listExamplesForTraining(
@@ -158,6 +166,10 @@ interface ExampleRow {
   input: string;
   result_json: string;
   split: ExampleSplit;
+  input_hash: string;
+  result_bin: string;
+  purpose: DatasetPurpose;
+  facets_json: string;
   created_at: number;
 }
 
@@ -218,6 +230,10 @@ const SCHEMA = `
     input TEXT NOT NULL,
     result_json TEXT NOT NULL,
     split TEXT NOT NULL CHECK (split IN ('training', 'held_out')),
+    input_hash TEXT NOT NULL DEFAULT '',
+    result_bin TEXT NOT NULL DEFAULT 'legacy',
+    purpose TEXT NOT NULL DEFAULT 'legacy_seen',
+    facets_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL,
     FOREIGN KEY (classifier_name, generation)
       REFERENCES generations(classifier_name, generation) ON DELETE CASCADE
@@ -227,6 +243,9 @@ const SCHEMA = `
     ON examples(classifier_name, generation, id);
   CREATE INDEX IF NOT EXISTS examples_by_split
     ON examples(classifier_name, generation, split, id);
+  CREATE UNIQUE INDEX IF NOT EXISTS examples_by_input
+    ON examples(classifier_name, generation, input_hash)
+    WHERE input_hash != '';
 
   CREATE TABLE IF NOT EXISTS classifier_runtimes (
     classifier_name TEXT NOT NULL,
@@ -240,6 +259,68 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS classifier_runtimes_by_heartbeat
     ON classifier_runtimes(classifier_name, heartbeat_at);
+
+  CREATE TABLE IF NOT EXISTS dataset_revisions (
+    id TEXT PRIMARY KEY,
+    classifier_name TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    data_epoch INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS dataset_revision_examples (
+    dataset_revision_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    input TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    result_bin TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK (purpose IN (
+      'training', 'validation', 'representative_test', 'coverage_test'
+    )),
+    facets_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    PRIMARY KEY (dataset_revision_id, position),
+    FOREIGN KEY (dataset_revision_id) REFERENCES dataset_revisions(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS training_runs (
+    id TEXT PRIMARY KEY,
+    dataset_revision_id TEXT NOT NULL,
+    classifier_name TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'failed', 'rejected', 'promoted')),
+    provider_run_id TEXT,
+    cost_usd REAL,
+    artifact_sha256 TEXT,
+    failure_message TEXT,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    FOREIGN KEY (dataset_revision_id) REFERENCES dataset_revisions(id) ON DELETE CASCADE,
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS training_evaluations (
+    training_run_id TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK (purpose IN ('representative_test', 'coverage_test')),
+    result_bin TEXT,
+    example_count INTEGER NOT NULL,
+    error REAL NOT NULL,
+    passed INTEGER NOT NULL,
+    PRIMARY KEY (training_run_id, purpose, result_bin),
+    FOREIGN KEY (training_run_id) REFERENCES training_runs(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS model_artifacts (
+    classifier_name TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    model_path TEXT NOT NULL,
+    needle_version TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (classifier_name, sha256),
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
 
   CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_insert
     BEFORE INSERT ON classifiers
@@ -318,6 +399,7 @@ export function openStorage(options: OpenStorageOptions): Storage {
     }
     database.exec(SCHEMA);
     migrateClassifierColumns(database);
+    migrateExampleColumns(database);
     const lockDirectory = join(options.dataDirectory, "locks");
     mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
     chmodSync(lockDirectory, 0o700);
@@ -461,9 +543,17 @@ export function openStorage(options: OpenStorageOptions): Storage {
       };
     },
 
-    addExample(input, result, expectedDataEpoch) {
+    addExample(input, result, expectedDataEpoch, metadata) {
       assertOpen(closed);
-      const split = assignExampleSplit(options.name, input);
+      const split = metadata === undefined
+        ? assignExampleSplit(options.name, input)
+        : metadata.purpose === "training"
+          ? "training"
+          : "held_out";
+      const inputHash = metadata?.inputHash ?? "";
+      const resultBin = metadata?.resultBin ?? "legacy";
+      const purpose = metadata?.purpose ?? "legacy_seen";
+      const facetsJson = stringifyJson(metadata?.facets ?? {}, "classification facets");
       const createdAt = Date.now();
       const resultJson = stringifyJson(result, "classification result");
       let id = 0;
@@ -475,11 +565,29 @@ export function openStorage(options: OpenStorageOptions): Storage {
         const epoch = expectedDataEpoch ?? state.data_epoch;
         if (state.data_epoch !== epoch || state.clear_pending === 1) return;
         generation = state.active_generation;
+        if (metadata !== undefined) {
+          database.prepare(`
+            DELETE FROM examples
+            WHERE classifier_name = ? AND generation = ? AND input_hash = ?
+          `).run(options.name, generation, inputHash);
+        }
         const insertion = database.prepare(`
           INSERT INTO examples (
-            classifier_name, generation, input, result_json, split, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?)
-        `).run(options.name, generation, input, resultJson, split, createdAt);
+            classifier_name, generation, input, result_json, split,
+            input_hash, result_bin, purpose, facets_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          options.name,
+          generation,
+          input,
+          resultJson,
+          split,
+          inputHash,
+          resultBin,
+          purpose,
+          facetsJson,
+          createdAt,
+        );
         id = Number(insertion.lastInsertRowid);
         accepted = true;
 
@@ -495,7 +603,18 @@ export function openStorage(options: OpenStorageOptions): Storage {
       });
 
       return accepted
-        ? { id, generation, input, result, split, createdAt }
+        ? {
+            id,
+            generation,
+            input,
+            result,
+            split,
+            inputHash,
+            resultBin,
+            purpose,
+            facets: metadata?.facets ?? {},
+            createdAt,
+          }
         : null;
     },
 
@@ -504,13 +623,15 @@ export function openStorage(options: OpenStorageOptions): Storage {
       const selectedGeneration = generation ?? activeGeneration(database, options.name);
       const rows = split === undefined
         ? database.prepare(`
-            SELECT id, generation, input, result_json, split, created_at
+            SELECT id, generation, input, result_json, split,
+                   input_hash, result_bin, purpose, facets_json, created_at
             FROM examples
             WHERE classifier_name = ? AND generation = ?
             ORDER BY id
           `).all(options.name, selectedGeneration)
         : database.prepare(`
-            SELECT id, generation, input, result_json, split, created_at
+            SELECT id, generation, input, result_json, split,
+                   input_hash, result_bin, purpose, facets_json, created_at
             FROM examples
             WHERE classifier_name = ? AND generation = ? AND split = ?
             ORDER BY id
@@ -532,7 +653,8 @@ export function openStorage(options: OpenStorageOptions): Storage {
           return;
         }
         examples = database.prepare(`
-          SELECT id, generation, input, result_json, split, created_at
+          SELECT id, generation, input, result_json, split,
+                 input_hash, result_bin, purpose, facets_json, created_at
           FROM examples
           WHERE classifier_name = ? AND generation = ? AND split = ?
           ORDER BY id
@@ -824,6 +946,12 @@ export function openStorage(options: OpenStorageOptions): Storage {
           DELETE FROM examples WHERE classifier_name = ?
         `).run(options.name);
         database.prepare(`
+          DELETE FROM dataset_revisions WHERE classifier_name = ?
+        `).run(options.name);
+        database.prepare(`
+          DELETE FROM model_artifacts WHERE classifier_name = ?
+        `).run(options.name);
+        database.prepare(`
           DELETE FROM generations WHERE classifier_name = ?
         `).run(options.name);
         database.prepare(`
@@ -1057,6 +1185,36 @@ function migrateClassifierColumns(database: DatabaseSyncType): void {
   });
 }
 
+function migrateExampleColumns(database: DatabaseSyncType): void {
+  transaction(database, () => {
+    const columns = new Set(
+      database.prepare("PRAGMA table_info(examples)").all().map((value) =>
+        row<{ name: string }>(value).name,
+      ),
+    );
+    if (!columns.has("input_hash")) {
+      database.exec(
+        "ALTER TABLE examples ADD COLUMN input_hash TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    if (!columns.has("result_bin")) {
+      database.exec(
+        "ALTER TABLE examples ADD COLUMN result_bin TEXT NOT NULL DEFAULT 'legacy'",
+      );
+    }
+    if (!columns.has("purpose")) {
+      database.exec(
+        "ALTER TABLE examples ADD COLUMN purpose TEXT NOT NULL DEFAULT 'legacy_seen'",
+      );
+    }
+    if (!columns.has("facets_json")) {
+      database.exec(
+        "ALTER TABLE examples ADD COLUMN facets_json TEXT NOT NULL DEFAULT '{}'",
+      );
+    }
+  });
+}
+
 function generationByNumber(
   database: DatabaseSyncType,
   name: string,
@@ -1078,18 +1236,47 @@ function trimExamples(
   generation: number,
   maxTrainingSet: number,
 ): void {
-  database.prepare(`
-    DELETE FROM examples
-    WHERE classifier_name = ?
-      AND generation = ?
-      AND id NOT IN (
+  const count = requiredRow<{ example_count: number }>(database.prepare(`
+    SELECT COUNT(*) AS example_count
+    FROM examples
+    WHERE classifier_name = ? AND generation = ?
+  `).get(name, generation)).example_count;
+  let excess = count - maxTrainingSet;
+  while (excess > 0) {
+    const fullest = requiredRow<{
+      result_bin: string;
+      purpose: DatasetPurpose;
+      facets_json: string;
+    }>(database.prepare(`
+      SELECT result_bin, purpose, facets_json
+      FROM examples
+      WHERE classifier_name = ? AND generation = ?
+      GROUP BY result_bin, purpose, facets_json
+      ORDER BY COUNT(*) DESC, MIN(id)
+      LIMIT 1
+    `).get(name, generation));
+    database.prepare(`
+      DELETE FROM examples
+      WHERE id = (
         SELECT id
         FROM examples
-        WHERE classifier_name = ? AND generation = ?
-        ORDER BY id DESC
-        LIMIT ?
+        WHERE classifier_name = ?
+          AND generation = ?
+          AND result_bin = ?
+          AND purpose = ?
+          AND facets_json = ?
+        ORDER BY id
+        LIMIT 1
       )
-  `).run(name, generation, name, generation, maxTrainingSet);
+    `).run(
+      name,
+      generation,
+      fullest.result_bin,
+      fullest.purpose,
+      fullest.facets_json,
+    );
+    excess -= 1;
+  }
 }
 
 function mapExample(stored: ExampleRow): StoredExample {
@@ -1099,6 +1286,10 @@ function mapExample(stored: ExampleRow): StoredExample {
     input: stored.input,
     result: JSON.parse(stored.result_json) as StoredResult,
     split: stored.split,
+    inputHash: stored.input_hash,
+    resultBin: stored.result_bin,
+    purpose: stored.purpose,
+    facets: JSON.parse(stored.facets_json) as ClassificationFacets<string>,
     createdAt: stored.created_at,
   };
 }

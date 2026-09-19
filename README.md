@@ -1,166 +1,159 @@
 # SwapAI
 
-SwapAI learns from an existing classifier, trains a local Needle 2 classifier,
-and only uses it after it has passed a held-out test.
+SwapAI collects answers from an existing classifier, trains a small Needle model
+elsewhere, and swaps only after the candidate passes protected tests.
 
 ```sh
-npm install @swapai/core
+npm install @swapai/core effect
 ```
 
-## Use it
+## Replace a classifier
 
 ```ts
-import { init } from "@swapai/core";
+import { createClassifier } from "@swapai/core";
+import { runpodTrainer } from "@swapai/core/runpod";
 
-const relevance = init({
+const relevance = createClassifier({
   name: "accountant-relevance",
   result: { type: "number", min: 0, max: 1 },
-  retrainOnCount: 50,
-  acceptableError: "10%",
-  retestInterval: 100,
-  retestRevertOn: 3,
-  model: "needle2",
-  maxTrainingSet: 10000,
+  decisionBoundaries: [0.5],
+  facets: ["documentFamily", "sourceKind"] as const,
+  reference: async (input) => (await classifyWithGrok(input)).score,
+  training: runpodTrainer({
+    apiKey: process.env.RUNPOD_API_KEY!,
+    maximumCostUsd: 1,
+  }),
 });
 
-const score = await relevance.classify(input, async (value) => {
-  const result = await callExistingClassifier(value);
-  return result.score;
+const score = await relevance.classify(input, {
+  documentFamily: "invoice",
+  sourceKind: "gmail",
 });
 ```
 
-Before the local classifier is trained, `classify` calls the supplied reference
-classifier and records its answer. Once the local classifier passes its
-held-out test, it takes over. SwapAI periodically calls both classifiers to
-check that the local result remains within the allowed error.
+That is the application interface. Before promotion, `classify` returns the
+Reference Classifier's answer and records it. After promotion, it uses the
+Needle model and periodically checks it against the Reference Classifier.
 
-`input` must be the complete input sent to the reference classifier, including
-the instruction that defines the classification task. Do not log only the raw
-text being classified: Needle needs the same task and context the reference saw.
-
-## Manual control
-
-The callback is optional. You can keep control of the switch yourself:
+Training is manual and never starts inside `classify`:
 
 ```ts
-if (relevance.isTrained()) {
-  return relevance.classify(input);
+const dataset = relevance.inspect();
+if (dataset.readyForTraining) {
+  const result = await relevance.requestTraining();
+  console.log(result.status); // promoted or rejected
 }
-
-const score = await callExistingClassifier(input);
-relevance.logClassification(input, score);
-return score;
 ```
 
-`isTrained()` and `logClassification()` are synchronous. Logging validates the
-result immediately and queues storage work. Use `await relevance.flush()` when
-you need to know all accepted examples are durable, such as during shutdown.
+`inspect()` explains missing result ranges and protected-test coverage. A high
+total is not treated as sufficient evidence.
 
-## Delete one classifier's training data
+## What SwapAI protects
+
+Every unique input is assigned deterministically to one purpose:
+
+- 65% training
+- 15% validation
+- 10% representative test
+- 10% coverage test
+
+Numeric results are automatically split into ordinary ranges plus smaller
+ranges around declared decision boundaries. Boolean and string results use one
+bin per allowed value. Optional facets preserve useful categories such as
+document family and source kind.
+
+When storage reaches `maxTrainingSet`, SwapAI evicts old examples from the
+fullest result/purpose/facet cell. Repeated inputs replace their earlier copy.
+This preserves rare examples instead of retaining only the latest traffic.
+
+`requestTraining()` freezes an immutable Dataset Revision. The Training
+Provider receives only training and validation examples. Representative and
+coverage tests stay in the control plane. A candidate is promoted only when
+its aggregate and per-result-bin errors all meet `acceptableError`.
+
+## Runpod
+
+The Runpod provider creates one Secure Pod, uploads one Dataset Revision, runs
+the pinned trainer image, downloads the candidate, and deletes that exact Pod.
+It verifies deletion on success and failure.
+
+```ts
+runpodTrainer({
+  apiKey: process.env.RUNPOD_API_KEY!,
+  maximumCostUsd: 1,
+  maximumRuntimeMinutes: 30,
+  // Optional. Defaults to ~/.ssh/id_ed25519, then ~/.ssh/id_rsa.
+  sshPrivateKey: process.env.SWAPAI_RUNPOD_SSH_PRIVATE_KEY,
+});
+```
+
+The provider rejects a Pod whose hourly price could exceed the declared cost
+ceiling. Pod names contain their hard deadline; later runs remove expired
+SwapAI Pods before allocating another. SwapAI never keeps a Pod intentionally.
+
+The default image is
+`ghcr.io/smccamley/swapai-trainer:0.4.0`. The image is built from
+[`trainer/Dockerfile`](trainer/Dockerfile) and pins `cactus-needle` 2.0.14 with
+its NVIDIA/JAX training dependencies.
+
+## Other training infrastructure
+
+Training infrastructure implements one small interface:
+
+```ts
+import type { TrainingProvider } from "@swapai/core";
+
+const awsTrainer: TrainingProvider = {
+  name: "aws",
+  async train(job) {
+    // Upload job.examples, run the trainer, download model.cact.
+    return { modelPath, needleVersion: "2.0.14", providerRunId };
+  },
+};
+```
+
+For a Mac, Windows machine, or a persistent worker, use `localTrainer()` or
+implement the same interface. `localTrainer()` is explicit; SwapAI does not
+silently train on the application host.
+
+## Observe classifiers
+
+```sh
+npx @swapai/core classifiers-ui --data-directory .swapai
+```
+
+Open `http://127.0.0.1:4789`. The read-only viewer shows retained versus
+observed examples, every dataset purpose, readiness gaps, trainer/provider,
+cost, candidate status, protected-test error, and promoted model state. It does
+not expose classification inputs, credentials, or model paths.
+
+Applications can use the same read-only library:
+
+```ts
+import { readClassifierStatuses } from "@swapai/core/classifiers-ui";
+
+const classifiers = readClassifierStatuses({ dataDirectory: ".swapai" });
+```
+
+## Erasure
 
 ```ts
 relevance.clearTrainingData();
 await relevance.flush();
 ```
 
-`clearTrainingData()` is synchronous and makes `isTrained()` return `false`
-immediately. It queues deletion of every retained example and saved model for
-this classifier name. `flush()` resolves after deletion is durable. Other
-classifiers and SwapAI's shared Needle runtime are left intact.
+This prevents further use of the model immediately, then securely deletes that
+classifier's examples, Dataset Revisions, Training Runs, and generation state.
+Other classifiers are untouched.
 
-A local classification already in progress cannot return an old-epoch result
-after the clear. It falls back to the supplied reference classifier, or rejects
-with `not_trained` when no reference was supplied. Its old-epoch result is not
-retained. Calls made after deletion finishes can build a new training set.
+## Compatibility
 
-If deletion cannot finish, `flush()` rejects and keeps the clear pending. A
-later `flush()` retries it. If the process exits, the next `init()` for that
-classifier finishes the pending deletion before any saved model can be used.
+The original `init()` interface remains available for existing applications.
+New applications should use `createClassifier()`: it configures the Reference
+Classifier once and disables in-process automatic training.
 
-## Result types
-
-SwapAI supports bounded numbers, booleans, and a closed list of strings:
-
-```ts
-init({
-  // other options
-  result: { type: "boolean" },
-});
-
-init({
-  // other options
-  result: { type: "string", values: ["rabbit", "fish", "pig"] },
-});
-```
-
-The string result is inferred as `"rabbit" | "fish" | "pig"`.
-
-Needle is a classifier, not a regression engine. For bounded numbers, SwapAI
-converts reference scores into a small, closed set of internal labels, then
-converts the selected label back to a number. When the training set contains
-only a few scores, those scores stay exact. Larger score sets are quantized to
-a bounded set based on `acceptableError`. The held-out test still compares the
-decoded number with the original reference score, so quantization consumes the
-same error budget and cannot bypass the accuracy gate.
-
-## Effect
-
-Effect is optional and lives in a separate import:
-
-```ts
-import { classifyWithReference } from "@swapai/core/effect";
-
-const program = classifyWithReference(relevance, input, callReferenceEffect);
-```
-
-## Classifier monitor
-
-Start the built-in local monitor against the same data directory as your
-classifiers:
-
-```sh
-npx @swapai/core classifiers-ui --data-directory .swapai
-```
-
-Then open `http://127.0.0.1:4789`. The page shows every stored classifier, its
-retained and lifetime example counts, last measured held-out error, target
-error, and whether it is loaded, training, or trained. The page refreshes every
-three seconds. SwapAI never returns classification inputs or saved model paths
-from the monitor API.
-
-If you want an npm script in your application:
-
-```json
-{
-  "scripts": {
-    "swapai:classifiers": "swapai classifiers-ui"
-  }
-}
-```
-
-```sh
-npm run swapai:classifiers
-```
-
-The server binds to `127.0.0.1` by default. Use `--host`, `--port`, or the
-`SWAPAI_DATA_DIRECTORY` environment variable when needed. Applications can
-also start it programmatically:
-
-```ts
-import { startClassifiersUi } from "@swapai/core/classifiers-ui";
-
-const monitor = await startClassifiersUi({
-  dataDirectory: ".swapai",
-  host: "127.0.0.1",
-  port: 4789,
-});
-```
-
-## Runtime
-
-Needle runs locally. On first use SwapAI creates its private runtime under
-`.swapai`, installs the pinned training package, and downloads Needle's model
-files. No Python setup is part of the TypeScript API. Set `dataDirectory` to
-store this state elsewhere.
-
-Full documentation: [stuartmccamley.com/swapai](https://stuartmccamley.com/swapai)
+Needle's official fine-tuning guide documents LoRA training, GPU/Metal extras,
+and the `.cact` artifact format:
+[cactus-compute/needle](https://github.com/cactus-compute/needle/blob/main/doc/finetuning.md).
+Runpod documents Pods and API keys at
+[docs.runpod.io](https://docs.runpod.io/).

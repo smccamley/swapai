@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import { normalizeConfig, validateResult } from "./config.js";
+import { prepareExampleMetadata } from "./dataset-policy.js";
 import { averageError, resultError } from "./evaluation.js";
 import { SwapAIError } from "./errors.js";
 import {
@@ -15,6 +16,7 @@ import {
 import { openStorage, type Storage } from "./storage.js";
 import type {
   Classifier,
+  ClassificationFacets,
   InitConfig,
   NormalizedInitConfig,
   ReferenceClassifier,
@@ -62,6 +64,9 @@ function openClassifierStorage<const Config extends ResultConfig>(
         retestInterval: config.retestInterval,
         retestRevertOn: config.retestRevertOn,
         model: config.model,
+        ...(config.datasetPolicy === undefined
+          ? {}
+          : { datasetPolicy: config.datasetPolicy }),
       },
     });
   } catch (error) {
@@ -132,7 +137,12 @@ function createClassifier<const Config extends ResultConfig>(
     }
   }
 
-  const startup = startRuntime();
+  let startup: Promise<void> | null = null;
+
+  function ensureRuntimeStarted(): Promise<void> {
+    startup ??= startRuntime();
+    return startup;
+  }
 
   async function startRuntime(): Promise<void> {
     const startupEpoch = dataEpoch;
@@ -249,11 +259,25 @@ function createClassifier<const Config extends ResultConfig>(
     input: string,
     result: Result,
     epoch = dataEpoch,
+    facets: ClassificationFacets<string> = {},
   ): Promise<void> {
     if (epoch !== dataEpoch) return Promise.resolve();
     return enqueue(() => {
       if (epoch !== dataEpoch) return;
-      if (storage.addExample(input, result, epoch) !== null) scheduleTraining();
+      const metadata = config.datasetPolicy === undefined
+        ? undefined
+        : prepareExampleMetadata(
+            config.name,
+            config.result,
+            config.acceptableError,
+            config.datasetPolicy,
+            input,
+            result,
+            facets,
+          );
+      if (storage.addExample(input, result, epoch, metadata) !== null) {
+        scheduleTraining();
+      }
     });
   }
 
@@ -263,6 +287,7 @@ function createClassifier<const Config extends ResultConfig>(
       snapshot.dataEpoch === dataEpoch &&
       !snapshot.clearPending &&
       !snapshot.trained &&
+      config.automaticTraining !== false &&
       snapshot.examplesUsedForTraining < config.maxTrainingSet &&
       snapshot.newExamplesSinceTraining >= config.retrainOnCount
     );
@@ -451,7 +476,7 @@ function createClassifier<const Config extends ResultConfig>(
   }
 
   async function model(expectedEpoch: number): Promise<LoadedNeedleModel> {
-    await startup;
+    await ensureRuntimeStarted();
     const current = refreshStoredState();
     if (
       !trained ||
@@ -526,6 +551,7 @@ function createClassifier<const Config extends ResultConfig>(
     candidateError: unknown,
     retestDue: boolean,
     epoch: number,
+    facets: ClassificationFacets<string>,
   ): Promise<Result> {
     if (reference === undefined) {
       throw toSwapAIError(
@@ -543,7 +569,7 @@ function createClassifier<const Config extends ResultConfig>(
       ),
     );
     const referenceResult = await callReference(input, reference);
-    await persistExample(input, referenceResult, epoch);
+    await persistExample(input, referenceResult, epoch, facets);
     if (retestDue && epoch === dataEpoch) {
       if (storage.recordLocalClassification(epoch) === null) return referenceResult;
       const failures = storage.recordRetest(false, epoch);
@@ -568,6 +594,7 @@ function createClassifier<const Config extends ResultConfig>(
     input: string,
     reference: ReferenceClassifier<Result> | undefined,
     epoch: number,
+    facets: ClassificationFacets<string>,
   ): Promise<Result> {
     assertOpen(closed);
 
@@ -579,7 +606,7 @@ function createClassifier<const Config extends ResultConfig>(
         );
       }
       const referenceResult = await callReference(input, reference);
-      await persistExample(input, referenceResult, epoch);
+      await persistExample(input, referenceResult, epoch, facets);
       return referenceResult;
     }
 
@@ -595,7 +622,14 @@ function createClassifier<const Config extends ResultConfig>(
         await (await model(epoch)).classify(input),
       );
     } catch (error) {
-      return fallbackToReference(input, reference, error, retestDue, epoch);
+      return fallbackToReference(
+        input,
+        reference,
+        error,
+        retestDue,
+        epoch,
+        facets,
+      );
     }
 
     const afterClassification = refreshStoredState();
@@ -612,6 +646,7 @@ function createClassifier<const Config extends ResultConfig>(
         ),
         retestDue,
         epoch,
+        facets,
       );
     }
 
@@ -629,13 +664,14 @@ function createClassifier<const Config extends ResultConfig>(
           ),
           retestDue,
           epoch,
+          facets,
         );
       }
       return candidateResult;
     }
 
     const referenceResult = await callReference(input, reference);
-    await persistExample(input, referenceResult, epoch);
+    await persistExample(input, referenceResult, epoch, facets);
     if (epoch !== dataEpoch) return referenceResult;
     if (storage.recordLocalClassification(epoch) === null) return referenceResult;
     const passed =
@@ -741,7 +777,12 @@ function createClassifier<const Config extends ResultConfig>(
 
   async function flushNow(): Promise<void> {
     const clearFailureBeforeFlush = clearFailure;
-    await startup;
+    if (
+      refreshStoredState().clearPending ||
+      config.automaticTraining !== false
+    ) {
+      await ensureRuntimeStarted();
+    }
     while (true) {
       const operations = operationQueue;
       await operations;
@@ -756,7 +797,10 @@ function createClassifier<const Config extends ResultConfig>(
       throw clearFailure;
     }
     const pending = refreshStoredState();
-    if (pending.clearPending || clearFailureBeforeFlush !== null) {
+    if (
+      (pending.clearPending || clearFailureBeforeFlush !== null) &&
+      clearFailure === clearFailureBeforeFlush
+    ) {
       try {
         await performDurableClear(pending.dataEpoch);
         if (!refreshStoredState().clearPending) clearFailure = null;
@@ -786,11 +830,11 @@ function createClassifier<const Config extends ResultConfig>(
       return trained;
     },
 
-    logClassification(input, result) {
+    logClassification(input, result, facets = {}) {
       assertOpen(closed || closing);
       const validResult = validateResult(config.result, result);
       const epoch = refreshStoredState().dataEpoch;
-      void persistExample(input, validResult, epoch);
+      void persistExample(input, validResult, epoch, facets);
     },
 
     clearTrainingData() {
@@ -801,7 +845,12 @@ function createClassifier<const Config extends ResultConfig>(
       const trainingBeforeClear = trainingQueue;
       const classificationsBeforeClear = classificationQueue;
       void enqueue(async () => {
-        await startup;
+        const clearFailureBeforeStartup = clearFailure;
+        await ensureRuntimeStarted();
+        if (
+          clearFailure !== null &&
+          clearFailure !== clearFailureBeforeStartup
+        ) return;
         await trainingBeforeClear;
         await classificationsBeforeClear;
         try {
@@ -812,11 +861,11 @@ function createClassifier<const Config extends ResultConfig>(
       });
     },
 
-    classify(input, reference) {
+    classify(input, reference, facets = {}) {
       assertOpen(closed || closing);
       const epoch = refreshStoredState().dataEpoch;
       const task = classificationQueue.then(() =>
-        classifyNow(input, reference, epoch),
+        classifyNow(input, reference, epoch, facets),
       );
       classificationQueue = task.then(
         () => undefined,

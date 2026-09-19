@@ -3,6 +3,17 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 
+import { readClassifierInspection } from "./dataset-inspection.js";
+import { createDatasetPolicy } from "./dataset-policy.js";
+import type {
+  DatasetDeficit,
+  DatasetPolicy,
+  DatasetPurpose,
+  ResultConfig,
+  ResultBinInspection,
+  TrainingRunInspection,
+} from "./types.js";
+
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
 const DEFAULT_LIVE_WITHIN_MS = 10_000;
@@ -32,6 +43,11 @@ export interface ClassifierStatus {
   readonly consecutiveRetestFailures: number;
   readonly needleVersion: string | null;
   readonly updatedAt: number;
+  readonly readyForTraining: boolean;
+  readonly deficits: readonly DatasetDeficit[];
+  readonly examplesByPurpose: Record<Exclude<DatasetPurpose, "legacy_seen">, number>;
+  readonly latestTrainingRun: TrainingRunInspection | null;
+  readonly resultBins: readonly ResultBinInspection[];
 }
 
 interface StatusRow {
@@ -131,6 +147,13 @@ export function readClassifierStatuses(
 
     return rows.map((stored) => {
       const config = parseConfig(stored.config_json);
+      const inspection = readClassifierInspection({
+        dataDirectory: options.dataDirectory,
+        name: stored.name,
+        result: config.result,
+        acceptableError: config.acceptableError,
+        policy: config.datasetPolicy,
+      });
       const liveRuntimes = liveByClassifier.get(stored.name) ?? new Set<string>();
       return {
         name: stored.name,
@@ -144,11 +167,12 @@ export function readClassifierStatuses(
         acceptableError: config.acceptableError,
         loaded: liveRuntimes.size > 0,
         loadedProcessCount: liveRuntimes.size,
-        training:
+        training: inspection.latestTrainingRun?.status === "running" || (
           stored.training_lease_owner !== null &&
           stored.training_lease_until !== null &&
           stored.training_lease_until > now &&
-          liveRuntimes.has(stored.training_lease_owner),
+          liveRuntimes.has(stored.training_lease_owner)
+        ),
         trained: stored.trained === 1,
         trainingAttempts: stored.training_attempts,
         totalLocalClassifications: stored.total_local_classifications,
@@ -156,6 +180,11 @@ export function readClassifierStatuses(
         consecutiveRetestFailures: stored.consecutive_retest_failures,
         needleVersion: stored.needle_version,
         updatedAt: stored.updated_at,
+        readyForTraining: inspection.readyForTraining,
+        deficits: inspection.deficits,
+        examplesByPurpose: inspection.examplesByPurpose,
+        latestTrainingRun: inspection.latestTrainingRun,
+        resultBins: inspection.resultBins,
       };
     });
   } finally {
@@ -165,11 +194,14 @@ export function readClassifierStatuses(
 
 function parseConfig(configJson: string): {
   resultType: "number" | "boolean" | "string";
+  result: ResultConfig;
   acceptableError: number;
+  datasetPolicy: DatasetPolicy;
 } {
   const config = JSON.parse(configJson) as {
-    result?: { type?: unknown };
+    result?: ResultConfig;
     acceptableError?: unknown;
+    datasetPolicy?: DatasetPolicy;
   };
   const resultType = config.result?.type;
   if (resultType !== "number" && resultType !== "boolean" && resultType !== "string") {
@@ -186,7 +218,10 @@ function parseConfig(configJson: string): {
   ) {
     throw new Error("Stored classifier has an invalid acceptable error");
   }
-  return { resultType, acceptableError };
+  const result = config.result;
+  if (result === undefined) throw new Error("Stored classifier has no result config");
+  const datasetPolicy = config.datasetPolicy ?? createDatasetPolicy(result, {});
+  return { resultType, result, acceptableError, datasetPolicy };
 }
 
 function parsePercentage(value: string): number {
