@@ -1,10 +1,15 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { openStorage } from "../src/storage.js";
+import { assignExampleSplit, openStorage } from "../src/storage.js";
 import { readClassifierStatuses } from "../src/classifiers-ui.js";
+
+const { DatabaseSync } = createRequire(import.meta.url)(
+  "node:sqlite",
+) as typeof import("node:sqlite");
 
 const temporaryDirectories: string[] = [];
 
@@ -63,5 +68,51 @@ describe("classifier status", () => {
       }),
     ]);
     storage.close();
+  });
+
+  it("inspects legacy examples before a classifier opens and migrates them", () => {
+    const dataDirectory = makeDirectory();
+    const name = "legacy-accountant-relevance";
+    const storage = openStorage({
+      dataDirectory,
+      name,
+      config: {
+        result: { type: "number", min: 0, max: 1 },
+        acceptableError: 0.1,
+        retrainOnCount: 50,
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+      },
+      maxTrainingSet: 10_000,
+    });
+    let input = "";
+    for (let index = 0; input === ""; index += 1) {
+      const candidate = `legacy-invoice-${index}`;
+      if (assignExampleSplit(name, candidate) === "training") input = candidate;
+    }
+    storage.addExample(input, 0.92);
+    storage.close();
+
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.exec("ALTER TABLE examples DROP COLUMN result_bin");
+    database.exec("ALTER TABLE examples DROP COLUMN purpose");
+    database.exec("ALTER TABLE examples DROP COLUMN facets_json");
+    database.close();
+
+    const [status] = readClassifierStatuses({ dataDirectory });
+    expect(status).toMatchObject({
+      name,
+      retainedExamples: 1,
+      examplesByPurpose: {
+        training: 1,
+        validation: 0,
+        representative_test: 0,
+        coverage_test: 0,
+      },
+    });
+    expect(
+      status!.resultBins.reduce((total, bin) => total + bin.total, 0),
+    ).toBe(1);
   });
 });

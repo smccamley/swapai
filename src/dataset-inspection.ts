@@ -2,7 +2,11 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
-import { resultBins } from "./dataset-policy.js";
+import { validateResult } from "./config.js";
+import {
+  prepareExampleMetadata,
+  resultBins,
+} from "./dataset-policy.js";
 import type {
   ClassifierInspection,
   DatasetDeficit,
@@ -21,6 +25,12 @@ interface CountRow {
   result_bin: string;
   purpose: DatasetPurpose;
   example_count: number;
+}
+
+interface LegacyExampleRow {
+  input: string;
+  result_json: string;
+  split: "training" | "held_out";
 }
 
 const emptyPurposes = () => ({
@@ -60,14 +70,17 @@ export const readClassifierInspection = (options: {
     if (classifier === undefined) {
       return inspectionFromCounts(options.name, bins, options.policy, 0, []);
     }
-    const counts = database.prepare(`
-      SELECT result_bin, purpose, COUNT(*) AS example_count
-      FROM examples
-      WHERE classifier_name = ?
-        AND generation = ?
-        AND purpose != 'legacy_seen'
-      GROUP BY result_bin, purpose
-    `).all(options.name, classifier.active_generation) as unknown as CountRow[];
+    const exampleColumns = tableColumns(database, "examples");
+    const counts = exampleColumns.has("result_bin") && exampleColumns.has("purpose")
+      ? database.prepare(`
+          SELECT result_bin, purpose, COUNT(*) AS example_count
+          FROM examples
+          WHERE classifier_name = ?
+            AND generation = ?
+            AND purpose != 'legacy_seen'
+          GROUP BY result_bin, purpose
+        `).all(options.name, classifier.active_generation) as unknown as CountRow[]
+      : legacyExampleCounts(database, options, classifier.active_generation);
     const latestTrainingRun = hasTable(database, "training_runs")
       ? mapTrainingRun(database.prepare(`
           SELECT id, dataset_revision_id, provider_name, status,
@@ -205,6 +218,49 @@ const hasTable = (
 ): boolean => database.prepare(`
   SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
 `).get(name) !== undefined;
+
+const tableColumns = (
+  database: InstanceType<typeof DatabaseSync>,
+  table: string,
+): Set<string> => new Set(
+  database.prepare(`PRAGMA table_info(${table})`).all().map(
+    (value) => (value as { name: string }).name,
+  ),
+);
+
+const legacyExampleCounts = (
+  database: InstanceType<typeof DatabaseSync>,
+  options: Parameters<typeof readClassifierInspection>[0],
+  generation: number,
+): CountRow[] => {
+  const examples = database.prepare(`
+    SELECT input, result_json, split
+    FROM examples
+    WHERE classifier_name = ? AND generation = ?
+    ORDER BY id
+  `).all(options.name, generation) as unknown as LegacyExampleRow[];
+  const counts = new Map<string, CountRow>();
+  for (const example of examples) {
+    const result = validateResult(options.result, JSON.parse(example.result_json));
+    const metadata = prepareExampleMetadata(
+      options.name,
+      options.result,
+      options.acceptableError,
+      options.policy,
+      example.input,
+      result,
+    );
+    const purpose = example.split === "training" ? "training" : "validation";
+    const key = `${metadata.resultBin}\0${purpose}`;
+    const existing = counts.get(key);
+    counts.set(key, {
+      result_bin: metadata.resultBin,
+      purpose,
+      example_count: (existing?.example_count ?? 0) + 1,
+    });
+  }
+  return [...counts.values()];
+};
 
 const mapTrainingRun = (value: unknown): TrainingRunInspection | null => {
   if (value === undefined) return null;
