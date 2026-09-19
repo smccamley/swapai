@@ -7,7 +7,9 @@ import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import type { PreparedExampleMetadata } from "./dataset-policy.js";
 import type { ClassificationFacets, DatasetPurpose } from "./types.js";
 
-const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+const { DatabaseSync } = createRequire(import.meta.url)(
+  "node:sqlite",
+) as typeof import("node:sqlite");
 
 export type StoredResult = number | boolean | string;
 export type ExampleSplit = "training" | "held_out";
@@ -18,6 +20,10 @@ export interface OpenStorageOptions {
   name: string;
   config: unknown;
   maxTrainingSet: number;
+  prepareLegacyExampleMetadata?: (
+    input: string,
+    result: StoredResult,
+  ) => PreparedExampleMetadata;
 }
 
 export interface StoredExample {
@@ -101,7 +107,10 @@ export interface Storage {
     generation: number,
     expectedDataEpoch: number,
   ): StoredExample[] | null;
-  markTrainingAttempted(exampleCount: number, expectedDataEpoch?: number): boolean;
+  markTrainingAttempted(
+    exampleCount: number,
+    expectedDataEpoch?: number,
+  ): boolean;
   recordEvaluation(error: number, expectedDataEpoch?: number): boolean;
   promoteGeneration(
     model: PromotedModel,
@@ -371,7 +380,10 @@ export function assignExampleSplit(name: string, input: string): ExampleSplit {
 }
 
 export function openStorage(options: OpenStorageOptions): Storage {
-  if (!Number.isSafeInteger(options.maxTrainingSet) || options.maxTrainingSet <= 0) {
+  if (
+    !Number.isSafeInteger(options.maxTrainingSet) ||
+    options.maxTrainingSet <= 0
+  ) {
     throw new TypeError("maxTrainingSet must be a positive integer");
   }
 
@@ -416,13 +428,18 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     const now = Date.now();
     const configJson = stringifyJson(options.config, "classifier config");
-    const existing = database.prepare(`
+    const existing = database
+      .prepare(
+        `
       SELECT config_json FROM classifiers WHERE name = ?
-    `).get(options.name) as { config_json: string } | undefined;
+    `,
+      )
+      .get(options.name) as { config_json: string } | undefined;
 
     if (
-      existing !== undefined
-      && criticalConfigJson(existing.config_json) !== criticalConfigJson(configJson)
+      existing !== undefined &&
+      criticalConfigJson(existing.config_json) !==
+        criticalConfigJson(configJson)
     ) {
       throw new TypeError(
         `Classifier "${options.name}" already exists with different result or behavior settings`,
@@ -430,7 +447,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
     }
 
     transaction(database, () => {
-      database.prepare(`
+      database
+        .prepare(
+          `
         INSERT INTO classifiers (
           name, config_json, max_training_set, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?)
@@ -438,13 +457,28 @@ export function openStorage(options: OpenStorageOptions): Storage {
           config_json = excluded.config_json,
           max_training_set = excluded.max_training_set,
           updated_at = excluded.updated_at
-      `).run(options.name, configJson, options.maxTrainingSet, now, now);
+      `,
+        )
+        .run(options.name, configJson, options.maxTrainingSet, now, now);
 
-      database.prepare(`
+      database
+        .prepare(
+          `
         INSERT OR IGNORE INTO generations (
           classifier_name, generation, status, created_at
         ) VALUES (?, 1, 'active', ?)
-      `).run(options.name, now);
+      `,
+        )
+        .run(options.name, now);
+
+      if (options.prepareLegacyExampleMetadata !== undefined) {
+        adoptLegacyExamples(
+          database,
+          options.name,
+          activeGeneration(database, options.name),
+          options.prepareLegacyExampleMetadata,
+        );
+      }
 
       trimExamples(
         database,
@@ -477,7 +511,10 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     snapshot() {
       assertOpen(closed);
-      const row = requiredRow<ClassifierRow>(database.prepare(`
+      const row = requiredRow<ClassifierRow>(
+        database
+          .prepare(
+            `
         SELECT
           c.name,
           c.config_json,
@@ -513,7 +550,10 @@ export function openStorage(options: OpenStorageOptions): Storage {
           ON g.classifier_name = c.name
           AND g.generation = c.active_generation
         WHERE c.name = ?
-      `).get(options.name));
+      `,
+          )
+          .get(options.name),
+      );
 
       return {
         name: row.name,
@@ -545,15 +585,19 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     addExample(input, result, expectedDataEpoch, metadata) {
       assertOpen(closed);
-      const split = metadata === undefined
-        ? assignExampleSplit(options.name, input)
-        : metadata.purpose === "training"
-          ? "training"
-          : "held_out";
+      const split =
+        metadata === undefined
+          ? assignExampleSplit(options.name, input)
+          : metadata.purpose === "training"
+            ? "training"
+            : "held_out";
       const inputHash = metadata?.inputHash ?? "";
       const resultBin = metadata?.resultBin ?? "legacy";
       const purpose = metadata?.purpose ?? "legacy_seen";
-      const facetsJson = stringifyJson(metadata?.facets ?? {}, "classification facets");
+      const facetsJson = stringifyJson(
+        metadata?.facets ?? {},
+        "classification facets",
+      );
       const createdAt = Date.now();
       const resultJson = stringifyJson(result, "classification result");
       let id = 0;
@@ -566,40 +610,57 @@ export function openStorage(options: OpenStorageOptions): Storage {
         if (state.data_epoch !== epoch || state.clear_pending === 1) return;
         generation = state.active_generation;
         if (metadata !== undefined) {
-          database.prepare(`
+          database
+            .prepare(
+              `
             DELETE FROM examples
             WHERE classifier_name = ? AND generation = ? AND input_hash = ?
-          `).run(options.name, generation, inputHash);
+          `,
+            )
+            .run(options.name, generation, inputHash);
         }
-        const insertion = database.prepare(`
+        const insertion = database
+          .prepare(
+            `
           INSERT INTO examples (
             classifier_name, generation, input, result_json, split,
             input_hash, result_bin, purpose, facets_json, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          options.name,
-          generation,
-          input,
-          resultJson,
-          split,
-          inputHash,
-          resultBin,
-          purpose,
-          facetsJson,
-          createdAt,
-        );
+        `,
+          )
+          .run(
+            options.name,
+            generation,
+            input,
+            resultJson,
+            split,
+            inputHash,
+            resultBin,
+            purpose,
+            facetsJson,
+            createdAt,
+          );
         id = Number(insertion.lastInsertRowid);
         accepted = true;
 
-        database.prepare(`
+        database
+          .prepare(
+            `
           UPDATE classifiers
           SET total_examples_logged = total_examples_logged + 1,
               new_examples_since_training = new_examples_since_training + 1,
               updated_at = ?
           WHERE name = ?
-        `).run(createdAt, options.name);
+        `,
+          )
+          .run(createdAt, options.name);
 
-        trimExamples(database, options.name, generation, options.maxTrainingSet);
+        trimExamples(
+          database,
+          options.name,
+          generation,
+          options.maxTrainingSet,
+        );
       });
 
       return accepted
@@ -620,22 +681,32 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     listExamples(split, generation) {
       assertOpen(closed);
-      const selectedGeneration = generation ?? activeGeneration(database, options.name);
-      const rows = split === undefined
-        ? database.prepare(`
+      const selectedGeneration =
+        generation ?? activeGeneration(database, options.name);
+      const rows =
+        split === undefined
+          ? database
+              .prepare(
+                `
             SELECT id, generation, input, result_json, split,
                    input_hash, result_bin, purpose, facets_json, created_at
             FROM examples
             WHERE classifier_name = ? AND generation = ?
             ORDER BY id
-          `).all(options.name, selectedGeneration)
-        : database.prepare(`
+          `,
+              )
+              .all(options.name, selectedGeneration)
+          : database
+              .prepare(
+                `
             SELECT id, generation, input, result_json, split,
                    input_hash, result_bin, purpose, facets_json, created_at
             FROM examples
             WHERE classifier_name = ? AND generation = ? AND split = ?
             ORDER BY id
-          `).all(options.name, selectedGeneration, split);
+          `,
+              )
+              .all(options.name, selectedGeneration, split);
 
       return rows.map((value) => mapExample(row<ExampleRow>(value)));
     },
@@ -652,15 +723,18 @@ export function openStorage(options: OpenStorageOptions): Storage {
         ) {
           return;
         }
-        examples = database.prepare(`
+        examples = database
+          .prepare(
+            `
           SELECT id, generation, input, result_json, split,
                  input_hash, result_bin, purpose, facets_json, created_at
           FROM examples
           WHERE classifier_name = ? AND generation = ? AND split = ?
           ORDER BY id
-        `).all(options.name, generation, split).map((value) =>
-          mapExample(row<ExampleRow>(value)),
-        );
+        `,
+          )
+          .all(options.name, generation, split)
+          .map((value) => mapExample(row<ExampleRow>(value)));
       });
       return examples;
     },
@@ -668,17 +742,23 @@ export function openStorage(options: OpenStorageOptions): Storage {
     markTrainingAttempted(exampleCount, expectedDataEpoch) {
       assertOpen(closed);
       if (!Number.isSafeInteger(exampleCount) || exampleCount <= 0) {
-        throw new TypeError("training example count must be a positive integer");
+        throw new TypeError(
+          "training example count must be a positive integer",
+        );
       }
       const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET new_examples_since_training = 0,
             training_attempts = training_attempts + 1,
             examples_used_for_training = ?,
             updated_at = ?
         WHERE name = ? AND data_epoch = ? AND clear_pending = 0
-      `).run(exampleCount, Date.now(), options.name, epoch);
+      `,
+        )
+        .run(exampleCount, Date.now(), options.name, epoch);
       return result.changes === 1;
     },
 
@@ -688,13 +768,17 @@ export function openStorage(options: OpenStorageOptions): Storage {
         throw new TypeError("evaluation error must be between 0 and 1");
       }
       const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET last_evaluated_error = ?,
             last_evaluated_at = ?,
             updated_at = ?
         WHERE name = ? AND data_epoch = ? AND clear_pending = 0
-      `).run(error, Date.now(), Date.now(), options.name, epoch);
+      `,
+        )
+        .run(error, Date.now(), Date.now(), options.name, epoch);
       return result.changes === 1;
     },
 
@@ -707,11 +791,15 @@ export function openStorage(options: OpenStorageOptions): Storage {
         const epoch = expectedDataEpoch ?? state.data_epoch;
         if (state.data_epoch !== epoch || state.clear_pending === 1) return;
         generation = state.active_generation;
-        database.prepare(`
+        database
+          .prepare(
+            `
           UPDATE generations
           SET trained = 1, model_path = ?, needle_version = ?
           WHERE classifier_name = ? AND generation = ?
-        `).run(model.modelPath, model.needleVersion, options.name, generation);
+        `,
+          )
+          .run(model.modelPath, model.needleVersion, options.name, generation);
         promoted = true;
       });
       return promoted
@@ -722,13 +810,17 @@ export function openStorage(options: OpenStorageOptions): Storage {
     recordLocalClassification(expectedDataEpoch) {
       assertOpen(closed);
       const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET local_classifications_since_retest = local_classifications_since_retest + 1,
             total_local_classifications = total_local_classifications + 1,
             updated_at = ?
         WHERE name = ? AND data_epoch = ? AND clear_pending = 0
-      `).run(Date.now(), options.name, epoch);
+      `,
+        )
+        .run(Date.now(), options.name, epoch);
       if (result.changes !== 1) return null;
       return storage.snapshot().localClassificationsSinceRetest;
     },
@@ -736,7 +828,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
     recordRetest(passed, expectedDataEpoch) {
       assertOpen(closed);
       const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET local_classifications_since_retest = 0,
             total_retests = total_retests + 1,
@@ -746,19 +840,29 @@ export function openStorage(options: OpenStorageOptions): Storage {
             END,
             updated_at = ?
         WHERE name = ? AND data_epoch = ? AND clear_pending = 0
-      `).run(passed ? 1 : 0, Date.now(), options.name, epoch);
+      `,
+        )
+        .run(passed ? 1 : 0, Date.now(), options.name, epoch);
       if (result.changes !== 1) return null;
       return storage.snapshot().consecutiveRetestFailures;
     },
 
     claimTrainingLease(owner, durationMs, expectedDataEpoch) {
       assertOpen(closed);
-      if (owner.trim() === "" || !Number.isSafeInteger(durationMs) || durationMs <= 0) {
-        throw new TypeError("training lease needs an owner and positive duration");
+      if (
+        owner.trim() === "" ||
+        !Number.isSafeInteger(durationMs) ||
+        durationMs <= 0
+      ) {
+        throw new TypeError(
+          "training lease needs an owner and positive duration",
+        );
       }
       const now = Date.now();
       const epoch = expectedDataEpoch ?? storage.snapshot().dataEpoch;
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET training_lease_owner = ?,
             training_lease_until = ?,
@@ -772,20 +876,35 @@ export function openStorage(options: OpenStorageOptions): Storage {
             OR training_lease_until <= ?
             OR training_lease_owner = ?
           )
-      `).run(owner, now + durationMs, epoch, now, options.name, epoch, now, owner);
+      `,
+        )
+        .run(
+          owner,
+          now + durationMs,
+          epoch,
+          now,
+          options.name,
+          epoch,
+          now,
+          owner,
+        );
       return result.changes === 1;
     },
 
     releaseTrainingLease(owner) {
       assertOpen(closed);
-      database.prepare(`
+      database
+        .prepare(
+          `
         UPDATE classifiers
         SET training_lease_owner = NULL,
             training_lease_until = NULL,
             training_lease_epoch = NULL,
             updated_at = ?
         WHERE name = ? AND training_lease_owner = ?
-      `).run(Date.now(), options.name, owner);
+      `,
+        )
+        .run(Date.now(), options.name, owner);
     },
 
     registerRuntime(runtimeId, pid) {
@@ -794,31 +913,43 @@ export function openStorage(options: OpenStorageOptions): Storage {
         throw new TypeError("runtime needs an id and positive process id");
       }
       const now = Date.now();
-      database.prepare(`
+      database
+        .prepare(
+          `
         INSERT INTO classifier_runtimes (
           classifier_name, runtime_id, pid, started_at, heartbeat_at
         ) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(classifier_name, runtime_id) DO UPDATE SET
           pid = excluded.pid,
           heartbeat_at = excluded.heartbeat_at
-      `).run(options.name, runtimeId, pid, now, now);
+      `,
+        )
+        .run(options.name, runtimeId, pid, now, now);
     },
 
     heartbeatRuntime(runtimeId) {
       assertOpen(closed);
-      database.prepare(`
+      database
+        .prepare(
+          `
         UPDATE classifier_runtimes
         SET heartbeat_at = ?
         WHERE classifier_name = ? AND runtime_id = ?
-      `).run(Date.now(), options.name, runtimeId);
+      `,
+        )
+        .run(Date.now(), options.name, runtimeId);
     },
 
     removeRuntime(runtimeId) {
       assertOpen(closed);
-      database.prepare(`
+      database
+        .prepare(
+          `
         DELETE FROM classifier_runtimes
         WHERE classifier_name = ? AND runtime_id = ?
-      `).run(options.name, runtimeId);
+      `,
+        )
+        .run(options.name, runtimeId);
     },
 
     listLiveRuntimes(heartbeatAfter) {
@@ -826,7 +957,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
       if (!Number.isFinite(heartbeatAfter)) {
         throw new TypeError("heartbeat cutoff must be finite");
       }
-      return database.prepare(`
+      return database
+        .prepare(
+          `
         SELECT
           runtime_id AS runtimeId,
           pid,
@@ -835,7 +968,10 @@ export function openStorage(options: OpenStorageOptions): Storage {
         FROM classifier_runtimes
         WHERE classifier_name = ? AND heartbeat_at >= ?
         ORDER BY started_at, runtime_id
-      `).all(options.name, heartbeatAfter).map((value) => row<StoredRuntime>(value));
+      `,
+        )
+        .all(options.name, heartbeatAfter)
+        .map((value) => row<StoredRuntime>(value));
     },
 
     archiveAndReset(expectedDataEpoch, resetOptions) {
@@ -849,35 +985,57 @@ export function openStorage(options: OpenStorageOptions): Storage {
         const epoch = expectedDataEpoch ?? state.data_epoch;
         if (state.data_epoch !== epoch || state.clear_pending === 1) return;
         const currentGeneration = state.active_generation;
-        database.prepare(`
+        database
+          .prepare(
+            `
           UPDATE generations
           SET status = 'archived', archived_at = ?
           WHERE classifier_name = ? AND generation = ?
-        `).run(changedAt, options.name, currentGeneration);
+        `,
+          )
+          .run(changedAt, options.name, currentGeneration);
 
-        const maximum = requiredRow<{ maximum: number }>(database.prepare(`
+        const maximum = requiredRow<{ maximum: number }>(
+          database
+            .prepare(
+              `
           SELECT MAX(generation) AS maximum
           FROM generations
           WHERE classifier_name = ?
-        `).get(options.name));
+        `,
+            )
+            .get(options.name),
+        );
         nextGeneration = maximum.maximum + 1;
 
-        database.prepare(`
+        database
+          .prepare(
+            `
           INSERT INTO generations (
             classifier_name, generation, status, created_at
           ) VALUES (?, ?, 'active', ?)
-        `).run(options.name, nextGeneration, changedAt);
+        `,
+          )
+          .run(options.name, nextGeneration, changedAt);
 
         let retainedExampleCount = 0;
         if (resetOptions?.retainExamples) {
-          retainedExampleCount = Number(database.prepare(`
+          retainedExampleCount = Number(
+            database
+              .prepare(
+                `
             UPDATE examples
             SET generation = ?
             WHERE classifier_name = ? AND generation = ?
-          `).run(nextGeneration, options.name, currentGeneration).changes);
+          `,
+              )
+              .run(nextGeneration, options.name, currentGeneration).changes,
+          );
         }
 
-        database.prepare(`
+        database
+          .prepare(
+            `
           UPDATE classifiers
           SET active_generation = ?,
               data_epoch = data_epoch + 1,
@@ -893,12 +1051,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
               consecutive_retest_failures = 0,
               updated_at = ?
           WHERE name = ?
-        `).run(
-          nextGeneration,
-          retainedExampleCount,
-          changedAt,
-          options.name,
-        );
+        `,
+          )
+          .run(nextGeneration, retainedExampleCount, changedAt, options.name);
         reset = true;
       });
 
@@ -909,7 +1064,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     beginClearTrainingData() {
       assertOpen(closed);
-      database.prepare(`
+      database
+        .prepare(
+          `
         UPDATE classifiers
         SET data_epoch = data_epoch + 1,
             clear_pending = 1,
@@ -921,7 +1078,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
             ),
             updated_at = ?
         WHERE name = ?
-      `).run(options.name, Date.now(), options.name);
+      `,
+        )
+        .run(options.name, Date.now(), options.name);
       return classifierState(database, options.name).data_epoch;
     },
 
@@ -935,31 +1094,59 @@ export function openStorage(options: OpenStorageOptions): Storage {
         const state = classifierState(database, options.name);
         if (state.data_epoch !== dataEpoch || state.clear_pending !== 1) return;
         if (state.clear_erased === 1) return;
-        const maximum = requiredRow<{ maximum: number }>(database.prepare(`
+        const maximum = requiredRow<{ maximum: number }>(
+          database
+            .prepare(
+              `
           SELECT MAX(generation) AS maximum
           FROM generations
           WHERE classifier_name = ?
-        `).get(options.name));
+        `,
+            )
+            .get(options.name),
+        );
         nextGeneration = maximum.maximum + 1;
 
-        database.prepare(`
+        database
+          .prepare(
+            `
           DELETE FROM examples WHERE classifier_name = ?
-        `).run(options.name);
-        database.prepare(`
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
           DELETE FROM dataset_revisions WHERE classifier_name = ?
-        `).run(options.name);
-        database.prepare(`
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
           DELETE FROM model_artifacts WHERE classifier_name = ?
-        `).run(options.name);
-        database.prepare(`
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
           DELETE FROM generations WHERE classifier_name = ?
-        `).run(options.name);
-        database.prepare(`
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
           INSERT INTO generations (
             classifier_name, generation, status, created_at
           ) VALUES (?, ?, 'active', ?)
-        `).run(options.name, nextGeneration, changedAt);
-        database.prepare(`
+        `,
+          )
+          .run(options.name, nextGeneration, changedAt);
+        database
+          .prepare(
+            `
           UPDATE classifiers
           SET active_generation = ?,
               total_examples_logged = 0,
@@ -978,7 +1165,9 @@ export function openStorage(options: OpenStorageOptions): Storage {
               clear_erased = 1,
               updated_at = ?
           WHERE name = ?
-        `).run(nextGeneration, changedAt, options.name);
+        `,
+          )
+          .run(nextGeneration, changedAt, options.name);
         erased = true;
       });
 
@@ -1000,14 +1189,18 @@ export function openStorage(options: OpenStorageOptions): Storage {
         return false;
       }
       truncateWriteAheadLog(database);
-      const result = database.prepare(`
+      const result = database
+        .prepare(
+          `
         UPDATE classifiers
         SET clear_pending = 0, updated_at = ?
         WHERE name = ?
           AND data_epoch = ?
           AND clear_pending = 1
           AND clear_erased = 1
-      `).run(Date.now(), options.name, dataEpoch);
+      `,
+        )
+        .run(Date.now(), options.name, dataEpoch);
       return result.changes === 1;
     },
 
@@ -1018,7 +1211,10 @@ export function openStorage(options: OpenStorageOptions): Storage {
       }
       try {
         const generation = storage.eraseTrainingData(dataEpoch);
-        if (generation === null || !storage.finishClearTrainingData(dataEpoch)) {
+        if (
+          generation === null ||
+          !storage.finishClearTrainingData(dataEpoch)
+        ) {
           throw new Error("Training data clear was superseded");
         }
         return generation;
@@ -1059,14 +1255,19 @@ export function openStorage(options: OpenStorageOptions): Storage {
 
     listGenerations() {
       assertOpen(closed);
-      return database.prepare(`
+      return database
+        .prepare(
+          `
         SELECT
           generation, status, trained, model_path, needle_version,
           created_at, archived_at
         FROM generations
         WHERE classifier_name = ?
         ORDER BY generation
-      `).all(options.name).map((value) => mapGeneration(row<GenerationRow>(value)));
+      `,
+        )
+        .all(options.name)
+        .map((value) => mapGeneration(row<GenerationRow>(value)));
     },
 
     close() {
@@ -1086,10 +1287,70 @@ export function openStorage(options: OpenStorageOptions): Storage {
   return storage;
 }
 
+function adoptLegacyExamples(
+  database: DatabaseSyncType,
+  name: string,
+  generation: number,
+  prepareMetadata: (
+    input: string,
+    result: StoredResult,
+  ) => PreparedExampleMetadata,
+): void {
+  const examples = database
+    .prepare(
+      `
+      SELECT id, input, result_json, split
+      FROM examples
+      WHERE classifier_name = ?
+        AND generation = ?
+        AND purpose = 'legacy_seen'
+      ORDER BY id
+    `,
+    )
+    .all(name, generation)
+    .map((value) =>
+      row<{
+        id: number;
+        input: string;
+        result_json: string;
+        split: ExampleSplit;
+      }>(value),
+    );
+  const update = database.prepare(`
+    UPDATE examples
+    SET input_hash = ?, result_bin = ?, purpose = ?, facets_json = ?
+    WHERE id = ?
+      AND classifier_name = ?
+      AND generation = ?
+      AND purpose = 'legacy_seen'
+  `);
+  for (const example of examples) {
+    const metadata = prepareMetadata(
+      example.input,
+      JSON.parse(example.result_json) as StoredResult,
+    );
+    update.run(
+      metadata.inputHash,
+      metadata.resultBin,
+      example.split === "training" ? "training" : "validation",
+      stringifyJson(metadata.facets, "classification facets"),
+      example.id,
+      name,
+      generation,
+    );
+  }
+}
+
 function activeGeneration(database: DatabaseSyncType, name: string): number {
-  const active = requiredRow<{ active_generation: number }>(database.prepare(`
+  const active = requiredRow<{ active_generation: number }>(
+    database
+      .prepare(
+        `
     SELECT active_generation FROM classifiers WHERE name = ?
-  `).get(name));
+  `,
+      )
+      .get(name),
+  );
   return active.active_generation;
 }
 
@@ -1125,7 +1386,10 @@ function classifierState(
   training_lease_epoch: number | null;
   training_lease_until: number | null;
 } {
-  return requiredRow(database.prepare(`
+  return requiredRow(
+    database
+      .prepare(
+        `
     SELECT
       active_generation,
       data_epoch,
@@ -1137,15 +1401,19 @@ function classifierState(
       training_lease_until
     FROM classifiers
     WHERE name = ?
-  `).get(name));
+  `,
+      )
+      .get(name),
+  );
 }
 
 function migrateClassifierColumns(database: DatabaseSyncType): void {
   transaction(database, () => {
     const columns = new Set(
-      database.prepare("PRAGMA table_info(classifiers)").all().map((value) =>
-        row<{ name: string }>(value).name,
-      ),
+      database
+        .prepare("PRAGMA table_info(classifiers)")
+        .all()
+        .map((value) => row<{ name: string }>(value).name),
     );
     if (!columns.has("data_epoch")) {
       database.exec(
@@ -1188,9 +1456,10 @@ function migrateClassifierColumns(database: DatabaseSyncType): void {
 function migrateExampleColumns(database: DatabaseSyncType): void {
   transaction(database, () => {
     const columns = new Set(
-      database.prepare("PRAGMA table_info(examples)").all().map((value) =>
-        row<{ name: string }>(value).name,
-      ),
+      database
+        .prepare("PRAGMA table_info(examples)")
+        .all()
+        .map((value) => row<{ name: string }>(value).name),
     );
     if (!columns.has("input_hash")) {
       database.exec(
@@ -1220,13 +1489,19 @@ function generationByNumber(
   name: string,
   generation: number,
 ): StoredGeneration {
-  const stored = requiredRow<GenerationRow>(database.prepare(`
+  const stored = requiredRow<GenerationRow>(
+    database
+      .prepare(
+        `
     SELECT
       generation, status, trained, model_path, needle_version,
       created_at, archived_at
     FROM generations
     WHERE classifier_name = ? AND generation = ?
-  `).get(name, generation));
+  `,
+      )
+      .get(name, generation),
+  );
   return mapGeneration(stored);
 }
 
@@ -1236,26 +1511,40 @@ function trimExamples(
   generation: number,
   maxTrainingSet: number,
 ): void {
-  const count = requiredRow<{ example_count: number }>(database.prepare(`
+  const count = requiredRow<{ example_count: number }>(
+    database
+      .prepare(
+        `
     SELECT COUNT(*) AS example_count
     FROM examples
     WHERE classifier_name = ? AND generation = ?
-  `).get(name, generation)).example_count;
+  `,
+      )
+      .get(name, generation),
+  ).example_count;
   let excess = count - maxTrainingSet;
   while (excess > 0) {
     const fullest = requiredRow<{
       result_bin: string;
       purpose: DatasetPurpose;
       facets_json: string;
-    }>(database.prepare(`
+    }>(
+      database
+        .prepare(
+          `
       SELECT result_bin, purpose, facets_json
       FROM examples
       WHERE classifier_name = ? AND generation = ?
       GROUP BY result_bin, purpose, facets_json
       ORDER BY COUNT(*) DESC, MIN(id)
       LIMIT 1
-    `).get(name, generation));
-    database.prepare(`
+    `,
+        )
+        .get(name, generation),
+    );
+    database
+      .prepare(
+        `
       DELETE FROM examples
       WHERE id = (
         SELECT id
@@ -1268,13 +1557,15 @@ function trimExamples(
         ORDER BY id
         LIMIT 1
       )
-    `).run(
-      name,
-      generation,
-      fullest.result_bin,
-      fullest.purpose,
-      fullest.facets_json,
-    );
+    `,
+      )
+      .run(
+        name,
+        generation,
+        fullest.result_bin,
+        fullest.purpose,
+        fullest.facets_json,
+      );
     excess -= 1;
   }
 }
