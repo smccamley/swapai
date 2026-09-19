@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createClassifier } from "../src/index.js";
+import { createClassifier, init } from "../src/index.js";
 import type { TrainingJob, TrainingProvider } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -22,6 +22,33 @@ afterEach(() => {
 });
 
 describe("createClassifier", () => {
+  it("opens data created by the 0.3 application configuration", async () => {
+    const dataDirectory = makeDirectory();
+    const legacy = init({
+      name: "accountant-relevance",
+      result: { type: "number", min: 0, max: 1 },
+      retrainOnCount: 50,
+      acceptableError: "10%",
+      retestInterval: 100,
+      retestRevertOn: 3,
+      model: "needle2",
+      maxTrainingSet: 10_000,
+      automaticTraining: false,
+      dataDirectory,
+    });
+    await legacy.close();
+
+    const relevance = createClassifier({
+      name: "accountant-relevance",
+      result: { type: "number", min: 0, max: 1 },
+      reference: async () => 0.8,
+      decisionBoundaries: [0.5],
+      dataDirectory,
+    });
+
+    await expect(relevance.close()).resolves.toBeUndefined();
+  });
+
   it("needs only a classifier definition and reference function", async () => {
     const reference = vi.fn(async (input: string) => input.includes("invoice"));
     const relevance = createClassifier({
