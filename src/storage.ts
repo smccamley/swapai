@@ -262,6 +262,21 @@ const SCHEMA = `
     FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS legacy_held_out_purpose_migrations (
+    classifier_name TEXT PRIMARY KEY,
+    plan_sha256 TEXT NOT NULL,
+    preserved_training_examples INTEGER NOT NULL,
+    validation_examples INTEGER NOT NULL,
+    representative_test_examples INTEGER NOT NULL,
+    coverage_test_examples INTEGER NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_training_attempts INTEGER NOT NULL,
+    observed_examples_used_for_training INTEGER NOT NULL,
+    migrated_at INTEGER NOT NULL,
+    FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS classifier_runtimes (
     classifier_name TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
@@ -1161,6 +1176,22 @@ export function openStorage(options: OpenStorageOptions): Storage {
         database
           .prepare(
             `
+          DELETE FROM legacy_held_out_purpose_migrations
+          WHERE classifier_name = ?
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
+          DELETE FROM legacy_dataset_purpose_adoptions
+          WHERE classifier_name = ?
+        `,
+          )
+          .run(options.name);
+        database
+          .prepare(
+            `
           DELETE FROM generations WHERE classifier_name = ?
         `,
           )
@@ -1680,6 +1711,7 @@ function installWriterVersion3Triggers(database: DatabaseSyncType): void {
     "training_evaluations",
     "model_artifacts",
     "shadow_evaluations",
+    "legacy_held_out_purpose_migrations",
   ];
   for (const table of tables) {
     for (const action of ["INSERT", "UPDATE", "DELETE"] as const) {

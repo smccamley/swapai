@@ -1,7 +1,23 @@
 export { init } from "./classifier.js";
 export { createClassifier } from "./create-classifier.js";
 export { localTrainer } from "./local-trainer.js";
+export {
+  inspectLegacyHeldOutMigration,
+  migrateLegacyHeldOutExamples,
+} from "./legacy-held-out-migration.js";
 export { SwapAIError } from "./errors.js";
+export type {
+  LegacyHeldOutMigrationAttestation,
+  LegacyHeldOutMigrationBlocker,
+  LegacyHeldOutMigrationBlockerCode,
+  LegacyHeldOutMigrationEvidence,
+  LegacyHeldOutMigrationGroup,
+  LegacyHeldOutMigrationInspection,
+  LegacyHeldOutMigrationOptions,
+  LegacyHeldOutMigrationResult,
+  LegacyHeldOutPurposeTargets,
+  MigrateLegacyHeldOutExamplesOptions,
+} from "./legacy-held-out-migration.js";
 export type {
   Classifier,
   ClassificationFacets,

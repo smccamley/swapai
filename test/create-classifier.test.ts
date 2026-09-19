@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,12 @@ import { createRequire } from "node:module";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createClassifier, init } from "../src/index.js";
+import {
+  createClassifier,
+  init,
+  inspectLegacyHeldOutMigration,
+  migrateLegacyHeldOutExamples,
+} from "../src/index.js";
 import { createDatasetPolicy } from "../src/dataset-policy.js";
 import type { TrainingJob, TrainingProvider } from "../src/index.js";
 
@@ -20,6 +25,14 @@ const makeDirectory = (): string => {
   temporaryDirectories.push(directory);
   return directory;
 };
+
+const zeroBinMinimums = {
+  minimumTrainingExamples: 1,
+  minimumTrainingExamplesPerResultBin: 0,
+  minimumValidationExamplesPerResultBin: 0,
+  minimumRepresentativeTestExamples: 0,
+  minimumCoverageTestExamplesPerResultBin: 0,
+} as const;
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -245,6 +258,508 @@ describe("createClassifier", () => {
     );
     await reopened.close();
   }, 15_000);
+
+  it("turns never-evaluated legacy held-out rows into protected suites without moving training rows", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "production-legacy-counters";
+    const legacy = init({
+      name,
+      result: { type: "number", min: 0, max: 1 },
+      retrainOnCount: 50,
+      acceptableError: "10%",
+      retestInterval: 100,
+      retestRevertOn: 3,
+      model: "needle2",
+      maxTrainingSet: 10_000,
+      automaticTraining: false,
+      dataDirectory,
+    });
+    for (let index = 0; index < 1_319; index += 1) {
+      legacy.logClassification(
+        `historic-example-${index}`,
+        index % 2 === 0 ? 0.92 : 0.08,
+      );
+    }
+    await legacy.close();
+
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database
+      .prepare(
+        `
+        UPDATE examples
+        SET split = CASE WHEN id <= 1049 THEN 'training' ELSE 'held_out' END
+        WHERE classifier_name = ?
+      `,
+      )
+      .run(name);
+    database
+      .prepare(
+        `
+        UPDATE classifiers
+        SET training_attempts = 24,
+            examples_used_for_training = 1309
+        WHERE name = ?
+      `,
+      )
+      .run(name);
+    database.close();
+    mimicVersion050LegacyAdoption(dataDirectory, name);
+
+    const firstOpen = createClassifier({
+      name,
+      result: { type: "number", min: 0, max: 1 },
+      reference: async () => 0.8,
+      decisionBoundaries: [0.5],
+      datasetRequirements: {
+        minimumTrainingExamples: 800,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 100,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+      dataDirectory,
+    });
+    expect(firstOpen.inspect().examplesByPurpose).toMatchObject({
+      training: 1_049,
+      validation: 270,
+      representative_test: 0,
+      coverage_test: 0,
+    });
+    await firstOpen.close();
+    const originalTrainingRowsSha256 = trainingRowsSha256(
+      dataDirectory,
+      name,
+    );
+
+    const classifierDirectory = join(
+      dataDirectory,
+      "classifiers",
+      createHash("sha256").update(name).digest("hex"),
+    );
+    mkdirSync(join(classifierDirectory, "generation-1", "candidates", "failed"), {
+      recursive: true,
+    });
+    mkdirSync(join(classifierDirectory, "generation-1", "checkpoints"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(
+        classifierDirectory,
+        "generation-1",
+        "candidates",
+        "failed",
+        "training.jsonl",
+      ),
+      "historic trainer input",
+    );
+    writeFileSync(
+      join(classifierDirectory, "generation-1", "checkpoints", "needle2.pkl"),
+      "shared base checkpoint",
+    );
+
+    const targetExamplesByPurpose = {
+      validation: 135,
+      representative_test: 100,
+      coverage_test: 35,
+    } as const;
+    const plan = inspectLegacyHeldOutMigration({
+      dataDirectory,
+      classifierName: name,
+      targetExamplesByPurpose,
+    });
+    expect(plan).toMatchObject({
+      status: "ready",
+      preservedTrainingExamples: 1_049,
+      eligibleHeldOutExamples: 270,
+      observedTrainingAttempts: 24,
+      observedExamplesUsedForTraining: 1_309,
+      blockers: [],
+      planSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(
+      plan.heldOutGroups.reduce((total, group) => total + group.examples, 0),
+    ).toBe(270);
+    expect(plan.heldOutGroups).toHaveLength(2);
+
+    const result = migrateLegacyHeldOutExamples({
+      dataDirectory,
+      classifierName: name,
+      targetExamplesByPurpose,
+      expectedPlanSha256: plan.planSha256,
+      attestation: {
+        heldOutExamplesWereNeverUsedForModelSelection: true,
+        operator: "production-migration",
+        reason: "No candidate model or evaluation exists",
+      },
+    });
+    expect(result).toMatchObject({
+      status: "migrated",
+      preservedTrainingExamples: 1_049,
+      examplesByPurpose: targetExamplesByPurpose,
+      planSha256: plan.planSha256,
+      evidence: {
+        observedTrainingAttempts: 24,
+        observedExamplesUsedForTraining: 1_309,
+      },
+    });
+    expect(trainingRowsSha256(dataDirectory, name)).toBe(
+      originalTrainingRowsSha256,
+    );
+
+    const classifier = createClassifier({
+      name,
+      result: { type: "number", min: 0, max: 1 },
+      reference: async () => 0.8,
+      decisionBoundaries: [0.5],
+      datasetRequirements: {
+        minimumTrainingExamples: 800,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 100,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+      dataDirectory,
+    });
+
+    const purposes = classifier.inspect().examplesByPurpose;
+    expect(purposes.training).toBe(1_049);
+    expect(purposes.validation).toBe(135);
+    expect(purposes.representative_test).toBe(100);
+    expect(purposes.coverage_test).toBe(35);
+    for (const resultBin of classifier.inspect().resultBins.filter(
+      (bin) => bin.total > 0,
+    )) {
+      expect(resultBin.purposes.validation).toBeGreaterThan(0);
+      expect(resultBin.purposes.representative_test).toBeGreaterThan(0);
+      expect(resultBin.purposes.coverage_test).toBeGreaterThan(0);
+    }
+    await classifier.close();
+
+    expect(
+      inspectLegacyHeldOutMigration({
+        dataDirectory,
+        classifierName: name,
+        targetExamplesByPurpose,
+      }),
+    ).toMatchObject({
+      status: "already_migrated",
+      planSha256: plan.planSha256,
+      priorMigration: {
+        operator: "production-migration",
+        reason: "No candidate model or evaluation exists",
+      },
+    });
+
+    const eraser = createClassifier({
+      name,
+      result: { type: "number", min: 0, max: 1 },
+      reference: async () => 0.8,
+      decisionBoundaries: [0.5],
+      datasetRequirements: {
+        minimumTrainingExamples: 800,
+        minimumTrainingExamplesPerResultBin: 0,
+        minimumValidationExamplesPerResultBin: 0,
+        minimumRepresentativeTestExamples: 100,
+        minimumCoverageTestExamplesPerResultBin: 0,
+      },
+      dataDirectory,
+    });
+    await eraser.erase();
+    await eraser.close();
+    expect(
+      inspectLegacyHeldOutMigration({
+        dataDirectory,
+        classifierName: name,
+        targetExamplesByPurpose,
+      }).priorMigration,
+    ).toBeNull();
+  }, 15_000);
+
+  it.each(["model.cact", "swapai-lora.pkl", "model.cact.numbers.json"])(
+    "blocks legacy held-out migration when candidate output %s exists",
+    async (candidateFile) => {
+      const dataDirectory = makeDirectory();
+      const name = `candidate-output-${candidateFile}`;
+      const legacy = init({
+        name,
+        result: { type: "boolean" },
+        retrainOnCount: 50,
+        acceptableError: "10%",
+        retestInterval: 100,
+        retestRevertOn: 3,
+        model: "needle2",
+        maxTrainingSet: 100,
+        automaticTraining: false,
+        dataDirectory,
+      });
+      for (let index = 0; index < 20; index += 1) {
+        legacy.logClassification(`historic-${index}`, index % 2 === 0);
+      }
+      await legacy.close();
+      const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+      database.function(
+        "swapai_writer_version",
+        { deterministic: true },
+        () => 3,
+      );
+      database
+        .prepare(
+          `
+          UPDATE examples
+          SET split = CASE WHEN id <= 15 THEN 'training' ELSE 'held_out' END
+          WHERE classifier_name = ?
+        `,
+        )
+        .run(name);
+      database
+        .prepare(
+          "UPDATE classifiers SET training_attempts = 1 WHERE name = ?",
+        )
+        .run(name);
+      database.close();
+      mimicVersion050LegacyAdoption(dataDirectory, name);
+
+      const configured = createClassifier({
+        name,
+        result: { type: "boolean" },
+        reference: async () => true,
+        datasetRequirements: {
+          minimumTrainingExamples: 1,
+          minimumTrainingExamplesPerResultBin: 0,
+          minimumValidationExamplesPerResultBin: 0,
+          minimumRepresentativeTestExamples: 0,
+          minimumCoverageTestExamplesPerResultBin: 0,
+        },
+        dataDirectory,
+      });
+      await configured.close();
+
+      const candidateDirectory = join(
+        dataDirectory,
+        "classifiers",
+        createHash("sha256").update(name).digest("hex"),
+        "generation-1",
+        "candidates",
+        "historic",
+      );
+      mkdirSync(candidateDirectory, { recursive: true });
+      writeFileSync(join(candidateDirectory, candidateFile), "candidate");
+
+      expect(
+        inspectLegacyHeldOutMigration({
+          dataDirectory,
+          classifierName: name,
+          targetExamplesByPurpose: {
+            validation: 2,
+            representative_test: 2,
+            coverage_test: 1,
+          },
+        }),
+      ).toMatchObject({
+        status: "blocked",
+        blockers: [
+          expect.objectContaining({ code: "candidate_artifact" }),
+        ],
+      });
+    },
+  );
+
+  it("requires every classifier runtime to stop before legacy held-out migration", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "offline-held-out-migration";
+    await prepareAttemptedLegacyDataset({
+      dataDirectory,
+      name,
+      totalExamples: 20,
+      trainingExamples: 15,
+    });
+    const configured = createClassifier({
+      name,
+      result: { type: "boolean" },
+      reference: async () => true,
+      datasetRequirements: zeroBinMinimums,
+      dataDirectory,
+    });
+    const options = {
+      dataDirectory,
+      classifierName: name,
+      targetExamplesByPurpose: {
+        validation: 2,
+        representative_test: 2,
+        coverage_test: 1,
+      },
+    } as const;
+
+    expect(inspectLegacyHeldOutMigration(options)).toMatchObject({
+      status: "blocked",
+      blockers: [expect.objectContaining({ code: "active_runtime" })],
+    });
+    await configured.close();
+    expect(inspectLegacyHeldOutMigration(options)).toMatchObject({
+      status: "ready",
+      blockers: [],
+    });
+  });
+
+  it("rejects a held-out migration when the reviewed plan changes", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "changed-held-out-plan";
+    await prepareAttemptedLegacyDataset({
+      dataDirectory,
+      name,
+      totalExamples: 20,
+      trainingExamples: 15,
+    });
+    const configured = createClassifier({
+      name,
+      result: { type: "boolean" },
+      reference: async () => true,
+      datasetRequirements: zeroBinMinimums,
+      dataDirectory,
+    });
+    await configured.close();
+    const options = {
+      dataDirectory,
+      classifierName: name,
+      targetExamplesByPurpose: {
+        validation: 2,
+        representative_test: 2,
+        coverage_test: 1,
+      },
+    } as const;
+    const reviewed = inspectLegacyHeldOutMigration(options);
+
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database
+      .prepare(
+        `
+        UPDATE examples SET facets_json = '{"changed":"yes"}'
+        WHERE id = (
+          SELECT MIN(id) FROM examples
+          WHERE classifier_name = ? AND split = 'held_out'
+        )
+      `,
+      )
+      .run(name);
+    database.close();
+
+    expect(() =>
+      migrateLegacyHeldOutExamples({
+        ...options,
+        expectedPlanSha256: reviewed.planSha256,
+        attestation: {
+          heldOutExamplesWereNeverUsedForModelSelection: true,
+          operator: "test-operator",
+          reason: "No candidate was produced",
+        },
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "storage_failed",
+        message: expect.stringContaining("plan changed"),
+      }),
+    );
+  });
+
+  it("blocks migration when a configured result bin cannot receive protected examples", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "missing-held-out-result-bin";
+    await prepareAttemptedLegacyDataset({
+      dataDirectory,
+      name,
+      totalExamples: 20,
+      trainingExamples: 15,
+    });
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database
+      .prepare(
+        "UPDATE examples SET result_json = 'true' WHERE classifier_name = ? AND split = 'held_out'",
+      )
+      .run(name);
+    database.close();
+    mimicVersion050LegacyAdoption(dataDirectory, name);
+    const configured = createClassifier({
+      name,
+      result: { type: "boolean" },
+      reference: async () => true,
+      datasetRequirements: {
+        ...zeroBinMinimums,
+        minimumValidationExamplesPerResultBin: 1,
+      },
+      dataDirectory,
+    });
+    await configured.close();
+
+    expect(
+      inspectLegacyHeldOutMigration({
+        dataDirectory,
+        classifierName: name,
+        targetExamplesByPurpose: {
+          validation: 2,
+          representative_test: 2,
+          coverage_test: 1,
+        },
+      }),
+    ).toMatchObject({
+      status: "blocked",
+      blockers: expect.arrayContaining([
+        expect.objectContaining({
+          code: "result_bin_lacks_protected_examples",
+        }),
+      ]),
+    });
+  });
+
+  it("blocks migration when legacy held-out evaluation evidence exists", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "evaluated-held-out-data";
+    await prepareAttemptedLegacyDataset({
+      dataDirectory,
+      name,
+      totalExamples: 20,
+      trainingExamples: 15,
+    });
+    const configured = createClassifier({
+      name,
+      result: { type: "boolean" },
+      reference: async () => true,
+      datasetRequirements: zeroBinMinimums,
+      dataDirectory,
+    });
+    await configured.close();
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database
+      .prepare(
+        `
+        UPDATE classifiers
+        SET last_evaluated_error = 0.2, last_evaluated_at = ?
+        WHERE name = ?
+      `,
+      )
+      .run(Date.now(), name);
+    database.close();
+
+    expect(
+      inspectLegacyHeldOutMigration({
+        dataDirectory,
+        classifierName: name,
+        targetExamplesByPurpose: {
+          validation: 2,
+          representative_test: 2,
+          coverage_test: 1,
+        },
+      }),
+    ).toMatchObject({
+      status: "blocked",
+      blockers: expect.arrayContaining([
+        expect.objectContaining({ code: "candidate_evaluation" }),
+      ]),
+    });
+  });
 
   it.each([
     "local attempt",
@@ -802,4 +1317,78 @@ const mimicVersion050LegacyAdoption = (
     )
     .run(classifierName);
   database.close();
+};
+
+const prepareAttemptedLegacyDataset = async (options: {
+  dataDirectory: string;
+  name: string;
+  totalExamples: number;
+  trainingExamples: number;
+}): Promise<void> => {
+  const legacy = init({
+    name: options.name,
+    result: { type: "boolean" },
+    retrainOnCount: 50,
+    acceptableError: "10%",
+    retestInterval: 100,
+    retestRevertOn: 3,
+    model: "needle2",
+    maxTrainingSet: 100,
+    automaticTraining: false,
+    dataDirectory: options.dataDirectory,
+  });
+  for (let index = 0; index < options.totalExamples; index += 1) {
+    legacy.logClassification(`historic-${index}`, index % 2 === 0);
+  }
+  await legacy.close();
+  const database = new DatabaseSync(
+    join(options.dataDirectory, "swapai.sqlite"),
+  );
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
+  database
+    .prepare(
+      `
+      UPDATE examples
+      SET split = CASE WHEN id <= ? THEN 'training' ELSE 'held_out' END
+      WHERE classifier_name = ?
+    `,
+    )
+    .run(options.trainingExamples, options.name);
+  database
+    .prepare(
+      `
+      UPDATE classifiers
+      SET training_attempts = 1,
+          examples_used_for_training = ?
+      WHERE name = ?
+    `,
+    )
+    .run(options.totalExamples, options.name);
+  database.close();
+  mimicVersion050LegacyAdoption(options.dataDirectory, options.name);
+};
+
+const trainingRowsSha256 = (
+  dataDirectory: string,
+  classifierName: string,
+): string => {
+  const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
+    readOnly: true,
+  });
+  try {
+    const rows = database
+      .prepare(
+        `
+        SELECT id, generation, input, result_json, split, input_hash,
+               result_bin, purpose, facets_json, created_at
+        FROM examples
+        WHERE classifier_name = ? AND split = 'training'
+        ORDER BY id
+      `,
+      )
+      .all(classifierName);
+    return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+  } finally {
+    database.close();
+  }
 };

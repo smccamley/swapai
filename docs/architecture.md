@@ -65,6 +65,15 @@ and child-process work, and follows every list page during orphan recovery.
 Its paid deadline includes reported compute, conservative container-storage
 cost, and deletion headroom.
 
+Attempted legacy datasets use a separate two-phase administrative boundary.
+Inspection produces a SHA-256 plan over the exact original held-out rows and
+explicit operator-selected purpose totals. Application requires the reviewed
+digest, a named model-selection attestation, no live classifier runtime, and no
+durable or filesystem candidate evidence. An exclusive SQLite transaction
+rechecks those facts before changing only original held-out purposes; original
+training rows remain untouched. The attestation and allocation are durable and
+idempotent.
+
 The project uses one npm package with explicit subpath imports instead of four
 packages. This keeps installation to one dependency while retaining the same
 boundaries as separate libraries:

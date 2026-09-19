@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://api.runpod.io/v2";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.0";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.1";
 const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const CONTAINER_DISK_GB = 30;
 const CONTAINER_DISK_USD_PER_GB_MONTH = 0.1;
