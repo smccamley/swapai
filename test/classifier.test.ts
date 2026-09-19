@@ -93,7 +93,7 @@ function setLegacyTrainingLease(
   leaseUntil: number,
 ): void {
   const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
-  database.function("swapai_writer_version", { deterministic: true }, () => 2);
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
   database.prepare(`
     UPDATE classifiers
     SET training_lease_owner = 'legacy-owner',

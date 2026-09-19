@@ -4,7 +4,7 @@ The public API is deliberately smaller than the implementation:
 
 ```text
 application
-  createClassifier → classify / inspect / requestTraining
+  createClassifier → classify / inspect / requestTraining / promoteCandidate
                          │
         ┌────────────────┼────────────────┐
         ▼                ▼                ▼
@@ -21,7 +21,13 @@ application
              protected local evaluation
                          │
                          ▼
-               content-addressed artifact
+               unpromoted candidate
+                         │
+                         ▼
+              fresh shadow evidence
+                         │
+                         ▼ explicit decision
+               promoted classifier
 ```
 
 ## Why these seams remain separate
@@ -37,11 +43,18 @@ compute. The trainer consumes a versioned job directory and creates a pinned
 Needle artifact. Either side can change without teaching the other about its
 internals.
 
-Protected tests remain outside the trainer so a training implementation cannot
-accidentally tune against its promotion exam. Aggregate error alone is
+Validation and protected tests remain outside the trainer so a training
+implementation cannot accidentally tune against its promotion exam. Aggregate error alone is
 insufficient: an imbalanced relevance dataset can make a constant low score
 look accurate. Promotion therefore requires every protected suite and result
-bin to pass.
+bin to pass. The provider receives training examples only. A candidate that
+passes frozen evidence remains non-authoritative until fresh reference-backed
+shadow evidence passes and the caller explicitly promotes its run ID.
+
+The trainer boundary is a versioned on-disk protocol. Input and output files
+are SHA-256 verified on both sides. Local and Runpod providers execute the same
+contract, so infrastructure choice cannot change what a trainer is allowed to
+see or return.
 
 The project uses one npm package with explicit subpath imports instead of four
 packages. This keeps installation to one dependency while retaining the same

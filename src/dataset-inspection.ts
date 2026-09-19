@@ -27,6 +27,12 @@ interface CountRow {
   example_count: number;
 }
 
+interface FacetCountRow {
+  facets_json: string;
+  purpose: DatasetPurpose;
+  example_count: number;
+}
+
 interface LegacyExampleRow {
   input: string;
   result_json: string;
@@ -81,24 +87,26 @@ export const readClassifierInspection = (options: {
           GROUP BY result_bin, purpose
         `).all(options.name, classifier.active_generation) as unknown as CountRow[]
       : legacyExampleCounts(database, options, classifier.active_generation);
-    const latestTrainingRun = hasTable(database, "training_runs")
-      ? mapTrainingRun(database.prepare(`
-          SELECT id, dataset_revision_id, provider_name, status,
-                 provider_run_id, cost_usd, artifact_sha256, failure_message,
-                 started_at, finished_at
-          FROM training_runs
-          WHERE classifier_name = ?
-          ORDER BY started_at DESC, id DESC
-          LIMIT 1
-        `).get(options.name))
-      : null;
+    const facetCounts: FacetCountRow[] = exampleColumns.has("facets_json") &&
+        exampleColumns.has("purpose")
+      ? database.prepare(`
+          SELECT facets_json, purpose, COUNT(*) AS example_count
+          FROM examples
+          WHERE classifier_name = ? AND generation = ? AND purpose != 'legacy_seen'
+          GROUP BY facets_json, purpose
+        `).all(options.name, classifier.active_generation) as unknown as FacetCountRow[]
+      : counts.map((count) => ({ facets_json: "{}", ...count }));
+    const trainingRuns = hasTable(database, "training_runs")
+      ? readTrainingRuns(database, options.name, options.acceptableError)
+      : [];
     return inspectionFromCounts(
       options.name,
       bins,
       options.policy,
       classifier.total_examples_logged,
       counts,
-      latestTrainingRun,
+      trainingRuns,
+      facetCounts,
     );
   } finally {
     database.close();
@@ -111,7 +119,8 @@ const inspectionFromCounts = (
   policy: DatasetPolicy,
   totalExamplesLogged: number,
   counts: readonly CountRow[],
-  latestTrainingRun: TrainingRunInspection | null = null,
+  trainingRuns: readonly TrainingRunInspection[] = [],
+  facetCounts: readonly FacetCountRow[] = [],
 ): ClassifierInspection => {
   const byBin = new Map<string, ReturnType<typeof emptyPurposes>>();
   for (const bin of bins) byBin.set(bin.id, emptyPurposes());
@@ -142,6 +151,33 @@ const inspectionFromCounts = (
   });
 
   const deficits: DatasetDeficit[] = [];
+  const facetGroups = new Map<string, {
+    facet: string;
+    value: string | null;
+    purposes: ReturnType<typeof emptyPurposes>;
+  }>();
+  for (const facet of policy.facets) {
+    facetGroups.set(`${facet}\0`, {
+      facet,
+      value: null,
+      purposes: emptyPurposes(),
+    });
+  }
+  for (const count of facetCounts) {
+    if (count.purpose === "legacy_seen") continue;
+    const facets = JSON.parse(count.facets_json) as Record<string, string>;
+    for (const facet of policy.facets) {
+      const value = facets[facet] ?? null;
+      const key = `${facet}\0${value ?? ""}`;
+      const group = facetGroups.get(key) ?? {
+        facet,
+        value,
+        purposes: emptyPurposes(),
+      };
+      group.purposes[count.purpose] += count.example_count;
+      facetGroups.set(key, group);
+    }
+  }
   const trainingTotal = resultBinInspections.reduce(
     (sum, bin) => sum + bin.purposes.training,
     0,
@@ -197,6 +233,18 @@ const inspectionFromCounts = (
     ),
     readyForTraining: deficits.length === 0,
     resultBins: resultBinInspections,
+    facetCoverage: [...facetGroups.values()]
+      .sort((left, right) =>
+        left.facet.localeCompare(right.facet) ||
+        (left.value ?? "").localeCompare(right.value ?? ""),
+      )
+      .map((group) => ({
+        ...group,
+        total: Object.values(group.purposes).reduce(
+          (sum, count) => sum + count,
+          0,
+        ),
+      })),
     deficits,
     examplesByPurpose: resultBinInspections.reduce(
       (totals, bin) => ({
@@ -208,7 +256,8 @@ const inspectionFromCounts = (
       }),
       emptyPurposes(),
     ),
-    latestTrainingRun,
+    latestTrainingRun: trainingRuns[0] ?? null,
+    trainingRuns,
   };
 };
 
@@ -262,8 +311,52 @@ const legacyExampleCounts = (
   return [...counts.values()];
 };
 
-const mapTrainingRun = (value: unknown): TrainingRunInspection | null => {
-  if (value === undefined) return null;
+const readTrainingRuns = (
+  database: InstanceType<typeof DatabaseSync>,
+  classifierName: string,
+  acceptableError: number,
+): readonly TrainingRunInspection[] => {
+  const columns = tableColumns(database, "training_runs");
+  const rows = database.prepare(`
+    SELECT id, dataset_revision_id, provider_name, status,
+           provider_run_id, cost_usd, artifact_sha256, failure_message,
+           ${columns.has("resources_json") ? "resources_json" : "'[]' AS resources_json"},
+           ${columns.has("cleanup_status") ? "cleanup_status" : "'not_required' AS cleanup_status"},
+           ${columns.has("cleanup_message") ? "cleanup_message" : "NULL AS cleanup_message"},
+           started_at, finished_at
+    FROM training_runs
+    WHERE classifier_name = ?
+    ORDER BY started_at DESC, id DESC
+  `).all(classifierName);
+  const evaluations = hasTable(database, "training_evaluations")
+    ? database.prepare(`
+        SELECT purpose, result_bin, example_count, error, passed
+        FROM training_evaluations
+        WHERE training_run_id = ?
+        ORDER BY purpose, result_bin
+      `)
+    : null;
+  const shadows = hasTable(database, "shadow_evaluations")
+    ? database.prepare(`
+        SELECT example_count, total_error, failure_count,
+               last_failure_message, last_evaluated_at
+        FROM shadow_evaluations WHERE training_run_id = ?
+      `)
+    : null;
+  return rows.map((value) => mapTrainingRun(
+    value,
+    evaluations?.all((value as { id: string }).id) ?? [],
+    shadows?.get((value as { id: string }).id),
+    acceptableError,
+  ));
+};
+
+const mapTrainingRun = (
+  value: unknown,
+  evaluationValues: readonly unknown[],
+  shadowValue: unknown,
+  acceptableError: number,
+): TrainingRunInspection => {
   const row = value as {
     id: string;
     dataset_revision_id: string;
@@ -273,9 +366,22 @@ const mapTrainingRun = (value: unknown): TrainingRunInspection | null => {
     cost_usd: number | null;
     artifact_sha256: string | null;
     failure_message: string | null;
+    resources_json: string;
+    cleanup_status: TrainingRunInspection["cleanup"]["status"];
+    cleanup_message: string | null;
     started_at: number;
     finished_at: number | null;
   };
+  const shadow = shadowValue as {
+    example_count: number;
+    total_error: number;
+    failure_count: number;
+    last_failure_message: string | null;
+    last_evaluated_at: number | null;
+  } | undefined;
+  const meanError = shadow === undefined || shadow.example_count === 0
+    ? null
+    : shadow.total_error / shadow.example_count;
   return {
     id: row.id,
     datasetRevisionId: row.dataset_revision_id,
@@ -285,6 +391,40 @@ const mapTrainingRun = (value: unknown): TrainingRunInspection | null => {
     costUsd: row.cost_usd,
     artifactSha256: row.artifact_sha256,
     failureMessage: row.failure_message,
+    resources: JSON.parse(row.resources_json) as TrainingRunInspection["resources"],
+    cleanup: {
+      status: row.cleanup_status,
+      message: row.cleanup_message,
+    },
+    evaluations: evaluationValues.map((value) => {
+      const metric = value as {
+        purpose: TrainingRunInspection["evaluations"][number]["purpose"];
+        result_bin: string | null;
+        example_count: number;
+        error: number;
+        passed: number;
+      };
+      return {
+        purpose: metric.purpose,
+        resultBin: metric.result_bin,
+        exampleCount: metric.example_count,
+        error: metric.error,
+        passed: metric.passed === 1,
+      };
+    }),
+    shadow: shadow === undefined
+      ? null
+      : {
+          exampleCount: shadow.example_count,
+          meanError,
+          passed:
+            meanError !== null &&
+            meanError <= acceptableError &&
+            shadow.failure_count === 0,
+          failureCount: shadow.failure_count,
+          lastFailureMessage: shadow.last_failure_message,
+          lastEvaluatedAt: shadow.last_evaluated_at,
+        },
     startedAt: row.started_at,
     finishedAt: row.finished_at,
   };

@@ -298,11 +298,16 @@ const SCHEMA = `
     dataset_revision_id TEXT NOT NULL,
     classifier_name TEXT NOT NULL,
     provider_name TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('running', 'failed', 'rejected', 'promoted')),
+    status TEXT NOT NULL CHECK (status IN (
+      'running', 'failed', 'rejected', 'candidate', 'promoted'
+    )),
     provider_run_id TEXT,
     cost_usd REAL,
     artifact_sha256 TEXT,
     failure_message TEXT,
+    resources_json TEXT NOT NULL DEFAULT '[]',
+    cleanup_status TEXT NOT NULL DEFAULT 'not_required',
+    cleanup_message TEXT,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     FOREIGN KEY (dataset_revision_id) REFERENCES dataset_revisions(id) ON DELETE CASCADE,
@@ -311,7 +316,9 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS training_evaluations (
     training_run_id TEXT NOT NULL,
-    purpose TEXT NOT NULL CHECK (purpose IN ('representative_test', 'coverage_test')),
+    purpose TEXT NOT NULL CHECK (purpose IN (
+      'validation', 'representative_test', 'coverage_test'
+    )),
     result_bin TEXT,
     example_count INTEGER NOT NULL,
     error REAL NOT NULL,
@@ -329,6 +336,16 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     PRIMARY KEY (classifier_name, sha256),
     FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS shadow_evaluations (
+    training_run_id TEXT PRIMARY KEY,
+    example_count INTEGER NOT NULL DEFAULT 0,
+    total_error REAL NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    last_failure_message TEXT,
+    last_evaluated_at INTEGER,
+    FOREIGN KEY (training_run_id) REFERENCES training_runs(id) ON DELETE CASCADE
   );
 
   CREATE TRIGGER IF NOT EXISTS swapai_v2_classifiers_insert
@@ -396,7 +413,7 @@ export function openStorage(options: OpenStorageOptions): Storage {
     database.function(
       "swapai_writer_version",
       { deterministic: true },
-      () => 2,
+      () => 3,
     );
     chmodSync(databasePath, 0o600);
     database.exec("PRAGMA journal_mode = WAL");
@@ -409,7 +426,14 @@ export function openStorage(options: OpenStorageOptions): Storage {
     if (secureDelete.secure_delete !== 1) {
       throw new Error("SQLite secure deletion could not be enabled");
     }
+    // The 0.3 schema already has these tables but not the dataset columns.
+    // Add columns before installing current indexes, which refer to them.
+    migrateExistingTablesBeforeCurrentSchema(database);
     database.exec(SCHEMA);
+    migrateTrainingRunStatus(database);
+    migrateTrainingRunColumns(database);
+    migrateTrainingEvaluationPurpose(database);
+    installWriterVersion3Triggers(database);
     migrateClassifierColumns(database);
     migrateExampleColumns(database);
     const lockDirectory = join(options.dataDirectory, "locks");
@@ -1405,6 +1429,139 @@ function classifierState(
       )
       .get(name),
   );
+}
+
+function migrateExistingTablesBeforeCurrentSchema(
+  database: DatabaseSyncType,
+): void {
+  const tables = new Set(
+    database
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all()
+      .map((value) => row<{ name: string }>(value).name),
+  );
+  if (tables.has("classifiers")) migrateClassifierColumns(database);
+  if (tables.has("examples")) migrateExampleColumns(database);
+}
+
+function migrateTrainingRunStatus(database: DatabaseSyncType): void {
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'training_runs'
+  `).get() as { sql: string } | undefined;
+  if (definition === undefined || definition.sql.includes("'candidate'")) return;
+
+  database.exec("PRAGMA foreign_keys = OFF");
+  try {
+    transaction(database, () => {
+      database.exec("PRAGMA legacy_alter_table = ON");
+      database.exec("ALTER TABLE training_runs RENAME TO training_runs_before_candidates");
+      database.exec(`
+        CREATE TABLE training_runs (
+          id TEXT PRIMARY KEY,
+          dataset_revision_id TEXT NOT NULL,
+          classifier_name TEXT NOT NULL,
+          provider_name TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN (
+            'running', 'failed', 'rejected', 'candidate', 'promoted'
+          )),
+          provider_run_id TEXT,
+          cost_usd REAL,
+          artifact_sha256 TEXT,
+          failure_message TEXT,
+          resources_json TEXT NOT NULL DEFAULT '[]',
+          cleanup_status TEXT NOT NULL DEFAULT 'not_required',
+          cleanup_message TEXT,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          FOREIGN KEY (dataset_revision_id) REFERENCES dataset_revisions(id) ON DELETE CASCADE,
+          FOREIGN KEY (classifier_name) REFERENCES classifiers(name) ON DELETE CASCADE
+        );
+        INSERT INTO training_runs (
+          id, dataset_revision_id, classifier_name, provider_name, status,
+          provider_run_id, cost_usd, artifact_sha256, failure_message,
+          started_at, finished_at
+        ) SELECT
+          id, dataset_revision_id, classifier_name, provider_name, status,
+          provider_run_id, cost_usd, artifact_sha256, failure_message,
+          started_at, finished_at
+        FROM training_runs_before_candidates;
+        DROP TABLE training_runs_before_candidates;
+      `);
+      database.exec("PRAGMA legacy_alter_table = OFF");
+    });
+  } finally {
+    database.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+function migrateTrainingRunColumns(database: DatabaseSyncType): void {
+  const columns = new Set(
+    database
+      .prepare("PRAGMA table_info(training_runs)")
+      .all()
+      .map((value) => row<{ name: string }>(value).name),
+  );
+  if (!columns.has("resources_json")) {
+    database.exec("ALTER TABLE training_runs ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!columns.has("cleanup_status")) {
+    database.exec("ALTER TABLE training_runs ADD COLUMN cleanup_status TEXT NOT NULL DEFAULT 'not_required'");
+  }
+  if (!columns.has("cleanup_message")) {
+    database.exec("ALTER TABLE training_runs ADD COLUMN cleanup_message TEXT");
+  }
+}
+
+function migrateTrainingEvaluationPurpose(database: DatabaseSyncType): void {
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name = 'training_evaluations'
+  `).get() as { sql: string } | undefined;
+  if (definition === undefined || definition.sql.includes("'validation'")) return;
+  transaction(database, () => {
+    database.exec("ALTER TABLE training_evaluations RENAME TO training_evaluations_before_validation");
+    database.exec(`
+      CREATE TABLE training_evaluations (
+        training_run_id TEXT NOT NULL,
+        purpose TEXT NOT NULL CHECK (purpose IN (
+          'validation', 'representative_test', 'coverage_test'
+        )),
+        result_bin TEXT,
+        example_count INTEGER NOT NULL,
+        error REAL NOT NULL,
+        passed INTEGER NOT NULL,
+        PRIMARY KEY (training_run_id, purpose, result_bin),
+        FOREIGN KEY (training_run_id) REFERENCES training_runs(id) ON DELETE CASCADE
+      );
+      INSERT INTO training_evaluations SELECT * FROM training_evaluations_before_validation;
+      DROP TABLE training_evaluations_before_validation;
+    `);
+  });
+}
+
+function installWriterVersion3Triggers(database: DatabaseSyncType): void {
+  const tables = [
+    "classifiers",
+    "generations",
+    "examples",
+    "classifier_runtimes",
+    "dataset_revisions",
+    "dataset_revision_examples",
+    "training_runs",
+    "training_evaluations",
+    "model_artifacts",
+    "shadow_evaluations",
+  ];
+  for (const table of tables) {
+    for (const action of ["INSERT", "UPDATE", "DELETE"] as const) {
+      database.exec(`
+        CREATE TRIGGER IF NOT EXISTS swapai_v3_${table}_${action.toLowerCase()}
+        BEFORE ${action} ON ${table}
+        WHEN swapai_writer_version() < 3
+        BEGIN SELECT RAISE(ABORT, 'SwapAI writer is too old'); END;
+      `);
+    }
+  }
 }
 
 function migrateClassifierColumns(database: DatabaseSyncType): void {

@@ -9,6 +9,7 @@ import type {
   DatasetDeficit,
   DatasetPolicy,
   DatasetPurpose,
+  FacetValueInspection,
   ResultConfig,
   ResultBinInspection,
   TrainingRunInspection,
@@ -17,6 +18,7 @@ import type {
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
 const DEFAULT_LIVE_WITHIN_MS = 10_000;
+const MAX_VISIBLE_TRAINING_RUNS = 100;
 
 export interface ReadClassifierStatusesOptions {
   readonly dataDirectory: string;
@@ -47,7 +49,9 @@ export interface ClassifierStatus {
   readonly deficits: readonly DatasetDeficit[];
   readonly examplesByPurpose: Record<Exclude<DatasetPurpose, "legacy_seen">, number>;
   readonly latestTrainingRun: TrainingRunInspection | null;
+  readonly trainingRuns: readonly TrainingRunInspection[];
   readonly resultBins: readonly ResultBinInspection[];
+  readonly facetCoverage: readonly FacetValueInspection[];
 }
 
 interface StatusRow {
@@ -184,7 +188,9 @@ export function readClassifierStatuses(
         deficits: inspection.deficits,
         examplesByPurpose: inspection.examplesByPurpose,
         latestTrainingRun: inspection.latestTrainingRun,
+        trainingRuns: inspection.trainingRuns.slice(0, MAX_VISIBLE_TRAINING_RUNS),
         resultBins: inspection.resultBins,
+        facetCoverage: inspection.facetCoverage,
       };
     });
   } finally {

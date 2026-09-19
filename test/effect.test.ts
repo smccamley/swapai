@@ -1,9 +1,23 @@
 import { Context, Effect, Either, Fiber } from "effect";
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { classify, classifyWithReference } from "../src/effect.js";
+import {
+  classify,
+  classifyConfigured,
+  classifyWithReference,
+  close,
+  erase,
+  flush,
+  inspect,
+  isTrained,
+  logClassification,
+  promoteCandidate,
+  reconcileTraining,
+  requestTraining,
+  retryTraining,
+} from "../src/effect.js";
 import { SwapAIError } from "../src/errors.js";
-import type { Classifier } from "../src/types.js";
+import type { Classifier, ConfiguredClassifier } from "../src/types.js";
 
 function classifierWith(
   run: Classifier<number>["classify"],
@@ -12,6 +26,7 @@ function classifierWith(
     isTrained: () => true,
     logClassification: () => undefined,
     clearTrainingData: () => undefined,
+    erase: async () => undefined,
     classify: run,
     flush: () => Promise.resolve(),
     close: () => Promise.resolve(),
@@ -19,6 +34,61 @@ function classifierWith(
 }
 
 describe("Effect adapter", () => {
+  it("wraps the complete configured classifier lifecycle", async () => {
+    const calls: string[] = [];
+    const configured: ConfiguredClassifier<boolean, "family"> = {
+      isTrained: () => true,
+      classify: async () => true,
+      logClassification: () => { calls.push("log"); },
+      inspect: () => ({
+        name: "configured", totalExamplesLogged: 0, retainedExamples: 0,
+        readyForTraining: false, resultBins: [], facetCoverage: [], deficits: [],
+        examplesByPurpose: {
+          training: 0, validation: 0, representative_test: 0, coverage_test: 0,
+        },
+        latestTrainingRun: null, trainingRuns: [],
+      }),
+      requestTraining: async () => ({ status: "not_ready", deficits: [] }),
+      retryTraining: async (trainingRunId) => ({
+        status: "rejected", trainingRunId, datasetRevisionId: "revision",
+      }),
+      promoteCandidate: async (trainingRunId) => ({
+        status: "promoted", trainingRunId, datasetRevisionId: "revision",
+      }),
+      reconcileTraining: async () => [],
+      erase: async () => { calls.push("erase"); },
+      flush: async () => { calls.push("flush"); },
+      close: async () => { calls.push("close"); },
+    };
+
+    await expect(Effect.runPromise(classifyConfigured(
+      configured,
+      "invoice",
+      { family: "invoice" },
+    ))).resolves.toBe(true);
+    await Effect.runPromise(logClassification(
+      configured,
+      "invoice",
+      true,
+      { family: "invoice" },
+    ));
+    await expect(Effect.runPromise(isTrained(configured))).resolves.toBe(true);
+    await expect(Effect.runPromise(inspect(configured))).resolves.toMatchObject({
+      name: "configured",
+    });
+    await expect(Effect.runPromise(requestTraining(configured))).resolves
+      .toMatchObject({ status: "not_ready" });
+    await expect(Effect.runPromise(retryTraining(configured, "run"))).resolves
+      .toMatchObject({ status: "rejected" });
+    await expect(Effect.runPromise(promoteCandidate(configured, "run"))).resolves
+      .toMatchObject({ status: "promoted" });
+    await expect(Effect.runPromise(reconcileTraining(configured))).resolves.toEqual([]);
+    await Effect.runPromise(erase(configured));
+    await Effect.runPromise(flush(configured));
+    await Effect.runPromise(close(configured));
+    expect(calls).toEqual(["log", "erase", "flush", "close"]);
+  });
+
   it("classifies through a native Effect", async () => {
     const classifier = classifierWith(() => Promise.resolve(0.81));
 
