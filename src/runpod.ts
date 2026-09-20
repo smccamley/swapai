@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://api.runpod.io/v2";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.2";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.3";
 const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const CONTAINER_DISK_GB = 30;
 const CONTAINER_DISK_USD_PER_GB_MONTH = 0.1;
@@ -349,18 +349,27 @@ const usePod = async (options: {
     options.sleep,
     options.signal,
   );
-  const connection = connected.ssh?.direct ?? connected.ssh?.proxy;
-  if (connection === undefined || connection === null) {
+  const connections = [connected.ssh?.direct, connected.ssh?.proxy].filter(
+    (connection): connection is NonNullable<typeof connection> =>
+      connection !== undefined && connection !== null,
+  );
+  if (connections.length === 0) {
     throw new Error(`Runpod Pod ${options.pod.id} did not provide SSH details`);
   }
-  const ssh = sshArguments(
-    connection.host,
-    connection.port,
-    options.privateKey,
-    join(options.job.outputDirectory, "runpod-known-hosts"),
-    connection.username,
+  const ssh = await waitForSsh(
+    connections.map((connection) =>
+      sshArguments(
+        connection.host,
+        connection.port,
+        options.privateKey,
+        join(options.job.outputDirectory, "runpod-known-hosts"),
+        connection.username,
+      ),
+    ),
+    options.runCommand,
+    options.sleep,
+    options.signal,
   );
-  await waitForSsh(ssh, options.runCommand, options.sleep, options.signal);
   const bundleDirectory = await writeTrainingBundle(options.job);
   const remoteDirectory = `/workspace/swapai-${options.job.id}`;
   await options.runCommand(
@@ -617,23 +626,37 @@ const waitForConnectablePod = async (
 };
 
 const waitForSsh = async (
-  ssh: readonly string[],
+  connections: readonly (readonly string[])[],
   runCommand: NonNullable<RunpodTrainerDependencies["runCommand"]>,
   sleep: NonNullable<RunpodTrainerDependencies["sleep"]>,
   signal: AbortSignal,
-): Promise<void> => {
+): Promise<readonly string[]> => {
+  let lastError: unknown;
   for (let attempt = 0; attempt < 120; attempt += 1) {
     signal.throwIfAborted();
-    try {
-      await runCommand("ssh", [...ssh, "true"], { signal });
-      return;
-    } catch (error) {
-      if (signal.aborted) throw signal.reason ?? error;
-      await waitWithSignal(sleep, 5_000, signal);
+    for (const ssh of connections) {
+      try {
+        await runCommand("ssh", [...ssh, "true"], { signal });
+        return ssh;
+      } catch (error) {
+        if (signal.aborted) throw signal.reason ?? error;
+        lastError = error;
+      }
     }
+    await waitWithSignal(sleep, 5_000, signal);
   }
-  throw new Error("Runpod Pod SSH did not become ready within 10 minutes");
+  const failure = boundedFailureMessage(lastError);
+  throw new Error(
+    `Runpod Pod SSH did not become ready within 10 minutes${failure === "" ? "" : `; last failure: ${failure}`}`,
+    lastError === undefined ? undefined : { cause: lastError },
+  );
 };
+
+const boundedFailureMessage = (error: unknown): string =>
+  (error instanceof Error ? error.message : String(error))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
 
 const deletePodVerified = async (
   api: ReturnType<typeof createRunpodApi>,
