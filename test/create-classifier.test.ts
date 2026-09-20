@@ -283,7 +283,11 @@ describe("createClassifier", () => {
     await legacy.close();
 
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
-    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 3,
+    );
     database
       .prepare(
         `
@@ -327,7 +331,9 @@ describe("createClassifier", () => {
       coverage_test: 0,
     });
     await firstOpen.close();
-    const originalTrainingRowsSha256 = trainingRowsSha256(
+    const originalTrainingRowsSha256 = trainingRowsSha256(dataDirectory, name);
+    insertFreshProtectedRowsAfterAdoption(dataDirectory, name);
+    const originalFreshProtectedRowsSha256 = freshProtectedRowsSha256(
       dataDirectory,
       name,
     );
@@ -337,9 +343,12 @@ describe("createClassifier", () => {
       "classifiers",
       createHash("sha256").update(name).digest("hex"),
     );
-    mkdirSync(join(classifierDirectory, "generation-1", "candidates", "failed"), {
-      recursive: true,
-    });
+    mkdirSync(
+      join(classifierDirectory, "generation-1", "candidates", "failed"),
+      {
+        recursive: true,
+      },
+    );
     mkdirSync(join(classifierDirectory, "generation-1", "checkpoints"), {
       recursive: true,
     });
@@ -406,6 +415,9 @@ describe("createClassifier", () => {
     expect(trainingRowsSha256(dataDirectory, name)).toBe(
       originalTrainingRowsSha256,
     );
+    expect(freshProtectedRowsSha256(dataDirectory, name)).toBe(
+      originalFreshProtectedRowsSha256,
+    );
 
     const classifier = createClassifier({
       name,
@@ -424,12 +436,12 @@ describe("createClassifier", () => {
 
     const purposes = classifier.inspect().examplesByPurpose;
     expect(purposes.training).toBe(1_049);
-    expect(purposes.validation).toBe(135);
-    expect(purposes.representative_test).toBe(100);
-    expect(purposes.coverage_test).toBe(35);
-    for (const resultBin of classifier.inspect().resultBins.filter(
-      (bin) => bin.total > 0,
-    )) {
+    expect(purposes.validation).toBe(136);
+    expect(purposes.representative_test).toBe(101);
+    expect(purposes.coverage_test).toBe(36);
+    for (const resultBin of classifier
+      .inspect()
+      .resultBins.filter((bin) => bin.total > 0)) {
       expect(resultBin.purposes.validation).toBeGreaterThan(0);
       expect(resultBin.purposes.representative_test).toBeGreaterThan(0);
       expect(resultBin.purposes.coverage_test).toBeGreaterThan(0);
@@ -513,9 +525,7 @@ describe("createClassifier", () => {
         )
         .run(name);
       database
-        .prepare(
-          "UPDATE classifiers SET training_attempts = 1 WHERE name = ?",
-        )
+        .prepare("UPDATE classifiers SET training_attempts = 1 WHERE name = ?")
         .run(name);
       database.close();
       mimicVersion050LegacyAdoption(dataDirectory, name);
@@ -558,9 +568,7 @@ describe("createClassifier", () => {
         }),
       ).toMatchObject({
         status: "blocked",
-        blockers: [
-          expect.objectContaining({ code: "candidate_artifact" }),
-        ],
+        blockers: [expect.objectContaining({ code: "candidate_artifact" })],
       });
     },
   );
@@ -619,6 +627,14 @@ describe("createClassifier", () => {
       dataDirectory,
     });
     await configured.close();
+    insertFreshProtectedExampleAfterAdoption({
+      dataDirectory,
+      classifierName: name,
+      input: "fresh-protected-after-review",
+      resultJson: "true",
+      resultBin: "true",
+      purpose: "representative_test",
+    });
     const options = {
       dataDirectory,
       classifierName: name,
@@ -631,15 +647,16 @@ describe("createClassifier", () => {
     const reviewed = inspectLegacyHeldOutMigration(options);
 
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
-    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 3,
+    );
     database
       .prepare(
         `
         UPDATE examples SET facets_json = '{"changed":"yes"}'
-        WHERE id = (
-          SELECT MIN(id) FROM examples
-          WHERE classifier_name = ? AND split = 'held_out'
-        )
+        WHERE classifier_name = ? AND input = 'fresh-protected-after-review'
       `,
       )
       .run(name);
@@ -663,6 +680,68 @@ describe("createClassifier", () => {
     );
   });
 
+  it("fails closed when a held-out row shares the legacy adoption timestamp", async () => {
+    const dataDirectory = makeDirectory();
+    const name = "ambiguous-adoption-boundary";
+    await prepareAttemptedLegacyDataset({
+      dataDirectory,
+      name,
+      totalExamples: 20,
+      trainingExamples: 15,
+    });
+    const configured = createClassifier({
+      name,
+      result: { type: "boolean" },
+      reference: async () => true,
+      datasetRequirements: zeroBinMinimums,
+      dataDirectory,
+    });
+    await configured.close();
+
+    const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 3,
+    );
+    database
+      .prepare(
+        `
+        UPDATE examples
+        SET created_at = (
+          SELECT adopted_at FROM legacy_dataset_purpose_adoptions
+          WHERE classifier_name = ?
+        )
+        WHERE id = (
+          SELECT MIN(id) FROM examples
+          WHERE classifier_name = ? AND split = 'held_out'
+        )
+      `,
+      )
+      .run(name, name);
+    database.close();
+
+    expect(
+      inspectLegacyHeldOutMigration({
+        dataDirectory,
+        classifierName: name,
+        targetExamplesByPurpose: {
+          validation: 2,
+          representative_test: 2,
+          coverage_test: 1,
+        },
+      }),
+    ).toMatchObject({
+      status: "blocked",
+      blockers: expect.arrayContaining([
+        expect.objectContaining({
+          code: "invalid_legacy_dataset",
+          message: expect.stringContaining("adoption timestamp"),
+        }),
+      ]),
+    });
+  });
+
   it("blocks migration when a configured result bin cannot receive protected examples", async () => {
     const dataDirectory = makeDirectory();
     const name = "missing-held-out-result-bin";
@@ -673,7 +752,11 @@ describe("createClassifier", () => {
       trainingExamples: 15,
     });
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
-    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 3,
+    );
     database
       .prepare(
         "UPDATE examples SET result_json = 'true' WHERE classifier_name = ? AND split = 'held_out'",
@@ -731,7 +814,11 @@ describe("createClassifier", () => {
     });
     await configured.close();
     const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
-    database.function("swapai_writer_version", { deterministic: true }, () => 3);
+    database.function(
+      "swapai_writer_version",
+      { deterministic: true },
+      () => 3,
+    );
     database
       .prepare(
         `
@@ -1383,6 +1470,121 @@ const trainingRowsSha256 = (
                result_bin, purpose, facets_json, created_at
         FROM examples
         WHERE classifier_name = ? AND split = 'training'
+        ORDER BY id
+      `,
+      )
+      .all(classifierName);
+    return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+  } finally {
+    database.close();
+  }
+};
+
+const insertFreshProtectedRowsAfterAdoption = (
+  dataDirectory: string,
+  classifierName: string,
+): void => {
+  const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"));
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
+  const adoption = database
+    .prepare(
+      `
+      SELECT adopted_at FROM legacy_dataset_purpose_adoptions
+      WHERE classifier_name = ?
+    `,
+    )
+    .get(classifierName) as { adopted_at: number };
+  const insert = database.prepare(
+    `
+    INSERT INTO examples (
+      classifier_name, generation, input, result_json, split, input_hash,
+      result_bin, purpose, facets_json, created_at
+    ) VALUES (?, 1, ?, '0.92', 'held_out', ?, '0.8..1', ?, '{}', ?)
+  `,
+  );
+  for (const [offset, purpose] of [
+    "validation",
+    "representative_test",
+    "coverage_test",
+  ].entries()) {
+    const input = `fresh-protected-${purpose}`;
+    insert.run(
+      classifierName,
+      input,
+      createHash("sha256").update(input).digest("hex"),
+      purpose,
+      adoption.adopted_at + offset + 1,
+    );
+  }
+  database
+    .prepare(
+      `
+      UPDATE classifiers
+      SET total_examples_logged = total_examples_logged + 3,
+          new_examples_since_training = new_examples_since_training + 3
+      WHERE name = ?
+    `,
+    )
+    .run(classifierName);
+  database.close();
+};
+
+const insertFreshProtectedExampleAfterAdoption = (options: {
+  dataDirectory: string;
+  classifierName: string;
+  input: string;
+  resultJson: string;
+  resultBin: string;
+  purpose: "validation" | "representative_test" | "coverage_test";
+}): void => {
+  const database = new DatabaseSync(
+    join(options.dataDirectory, "swapai.sqlite"),
+  );
+  database.function("swapai_writer_version", { deterministic: true }, () => 3);
+  const adoption = database
+    .prepare(
+      `
+      SELECT adopted_at FROM legacy_dataset_purpose_adoptions
+      WHERE classifier_name = ?
+    `,
+    )
+    .get(options.classifierName) as { adopted_at: number };
+  database
+    .prepare(
+      `
+      INSERT INTO examples (
+        classifier_name, generation, input, result_json, split, input_hash,
+        result_bin, purpose, facets_json, created_at
+      ) VALUES (?, 1, ?, ?, 'held_out', ?, ?, ?, '{}', ?)
+    `,
+    )
+    .run(
+      options.classifierName,
+      options.input,
+      options.resultJson,
+      createHash("sha256").update(options.input).digest("hex"),
+      options.resultBin,
+      options.purpose,
+      adoption.adopted_at + 1,
+    );
+  database.close();
+};
+
+const freshProtectedRowsSha256 = (
+  dataDirectory: string,
+  classifierName: string,
+): string => {
+  const database = new DatabaseSync(join(dataDirectory, "swapai.sqlite"), {
+    readOnly: true,
+  });
+  try {
+    const rows = database
+      .prepare(
+        `
+        SELECT id, generation, input, result_json, split, input_hash,
+               result_bin, purpose, facets_json, created_at
+        FROM examples
+        WHERE classifier_name = ? AND input LIKE 'fresh-protected-%'
         ORDER BY id
       `,
       )

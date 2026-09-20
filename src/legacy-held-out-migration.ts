@@ -81,8 +81,7 @@ export interface LegacyHeldOutMigrationAttestation {
   readonly reason: string;
 }
 
-export interface MigrateLegacyHeldOutExamplesOptions
-  extends LegacyHeldOutMigrationOptions {
+export interface MigrateLegacyHeldOutExamplesOptions extends LegacyHeldOutMigrationOptions {
   readonly expectedPlanSha256: string;
   readonly attestation: LegacyHeldOutMigrationAttestation;
 }
@@ -101,10 +100,13 @@ interface LegacyExample {
   readonly input_hash: string;
   readonly result_bin: string;
   readonly facets_json: string;
+  readonly purpose: string;
+  readonly created_at: number;
 }
 
 interface PlannedMigration extends LegacyHeldOutMigrationInspection {
   readonly assignments: ReadonlyMap<number, keyof LegacyHeldOutPurposeTargets>;
+  readonly legacyAdoptedAt: number | null;
 }
 
 interface StoredClassifier {
@@ -169,7 +171,9 @@ export const migrateLegacyHeldOutExamples = (
   options: MigrateLegacyHeldOutExamplesOptions,
 ): LegacyHeldOutMigrationResult => {
   requireAttestation(options.attestation);
-  const database = new DatabaseSync(join(options.dataDirectory, "swapai.sqlite"));
+  const database = new DatabaseSync(
+    join(options.dataDirectory, "swapai.sqlite"),
+  );
   database.function("swapai_writer_version", { deterministic: true }, () => 3);
   database.exec("PRAGMA foreign_keys = ON");
   database.exec("PRAGMA busy_timeout = 5000");
@@ -193,6 +197,12 @@ export const migrateLegacyHeldOutExamples = (
         plan.blockers.map((blocker) => blocker.message).join("; "),
       );
     }
+    if (plan.legacyAdoptedAt === null) {
+      throw new SwapAIError(
+        "storage_failed",
+        "Legacy adoption provenance disappeared while holding the offline lock",
+      );
+    }
 
     const update = database.prepare(`
       UPDATE examples
@@ -202,6 +212,7 @@ export const migrateLegacyHeldOutExamples = (
         AND generation = ?
         AND split = 'held_out'
         AND purpose = 'validation'
+        AND created_at < ?
     `);
     const activeGeneration = requiredClassifier(
       database,
@@ -213,6 +224,7 @@ export const migrateLegacyHeldOutExamples = (
         id,
         options.classifierName,
         activeGeneration,
+        plan.legacyAdoptedAt,
       );
       if (result.changes !== 1) {
         throw new SwapAIError(
@@ -312,6 +324,7 @@ const buildPlan = (
           prior.observed_examples_used_for_training,
       },
       assignments: new Map(),
+      legacyAdoptedAt: null,
     };
   }
 
@@ -321,32 +334,31 @@ const buildPlan = (
     classifier.active_generation,
     "training",
   );
-  const heldOut = database
-    .prepare(
-      `
-      SELECT id, input_hash, result_bin, facets_json
-      FROM examples
-      WHERE classifier_name = ?
-        AND generation = ?
-        AND split = 'held_out'
-        AND purpose = 'validation'
-      ORDER BY id
-    `,
-    )
-    .all(options.classifierName, classifier.active_generation)
-    .map((value) => value as unknown as LegacyExample);
-  const totalHeldOut = countExamples(
+  const allHeldOut = readHeldOutExamples(
     database,
     options.classifierName,
     classifier.active_generation,
-    "held_out",
   );
+  const legacyAdoptedAt = readLegacyAdoptedAt(database, options.classifierName);
+  const preAdoptionHeldOut =
+    legacyAdoptedAt === null
+      ? []
+      : allHeldOut.filter((example) => example.created_at < legacyAdoptedAt);
+  const heldOut = preAdoptionHeldOut.filter(
+    (example) => example.purpose === "validation",
+  );
+  const ambiguousBoundaryExamples =
+    legacyAdoptedAt === null
+      ? []
+      : allHeldOut.filter((example) => example.created_at === legacyAdoptedAt);
   const blockers = evidenceBlockers(
     database,
     options,
     classifier,
     heldOut.length,
-    totalHeldOut,
+    preAdoptionHeldOut.length,
+    legacyAdoptedAt,
+    ambiguousBoundaryExamples.length,
   );
   const storedPolicy = readStoredPolicy(classifier.config_json);
   addTargetBlockers(
@@ -356,19 +368,26 @@ const buildPlan = (
     storedPolicy.requirements,
     storedPolicy.resultBinIds,
   );
-  const assignments = blockers.length === 0
-    ? assignProtectedPurposes(
-        heldOut,
-        options.targetExamplesByPurpose,
-        storedPolicy.requirements,
-      )
-    : new Map<number, keyof LegacyHeldOutPurposeTargets>();
+  const assignments =
+    blockers.length === 0
+      ? assignProtectedPurposes(
+          heldOut,
+          options.targetExamplesByPurpose,
+          storedPolicy.requirements,
+        )
+      : new Map<number, keyof LegacyHeldOutPurposeTargets>();
   const planSha256 = hashPlan({
     classifierName: options.classifierName,
     generation: classifier.active_generation,
     trainingCount,
     trainingAttempts: classifier.training_attempts,
     examplesUsedForTraining: classifier.examples_used_for_training,
+    legacyAdoptedAt,
+    allExamples: readPlanExamples(
+      database,
+      options.classifierName,
+      classifier.active_generation,
+    ),
     heldOut,
     targets: options.targetExamplesByPurpose,
     requirements: storedPolicy.requirements,
@@ -388,6 +407,7 @@ const buildPlan = (
     blockers,
     priorMigration: null,
     assignments,
+    legacyAdoptedAt,
   };
 };
 
@@ -399,7 +419,7 @@ const readHeldOutExamples = (
   database
     .prepare(
       `
-      SELECT id, input_hash, result_bin, facets_json
+      SELECT id, input_hash, result_bin, facets_json, purpose, created_at
       FROM examples
       WHERE classifier_name = ? AND generation = ? AND split = 'held_out'
       ORDER BY id
@@ -413,7 +433,9 @@ const evidenceBlockers = (
   options: LegacyHeldOutMigrationOptions,
   classifier: StoredClassifier,
   eligibleHeldOutCount: number,
-  totalHeldOutCount: number,
+  preAdoptionHeldOutCount: number,
+  legacyAdoptedAt: number | null,
+  ambiguousBoundaryExampleCount: number,
 ): LegacyHeldOutMigrationBlocker[] => {
   const blockers: LegacyHeldOutMigrationBlocker[] = [];
   const liveRuntime = database
@@ -424,14 +446,12 @@ const evidenceBlockers = (
       LIMIT 1
     `,
     )
-    .get(
-      options.classifierName,
-      Date.now() - LIVE_RUNTIME_WINDOW_MILLISECONDS,
-    );
+    .get(options.classifierName, Date.now() - LIVE_RUNTIME_WINDOW_MILLISECONDS);
   if (liveRuntime !== undefined) {
     blockers.push({
       code: "active_runtime",
-      message: "Stop every classifier runtime before migrating legacy held-out examples",
+      message:
+        "Stop every classifier runtime before migrating legacy held-out examples",
     });
   }
   if (
@@ -442,7 +462,8 @@ const evidenceBlockers = (
   ) {
     blockers.push({
       code: "candidate_evaluation",
-      message: "Stored candidate evaluation evidence proves held-out model selection",
+      message:
+        "Stored candidate evaluation evidence proves held-out model selection",
     });
   }
   const generations = database
@@ -453,19 +474,20 @@ const evidenceBlockers = (
     `,
     )
     .all(options.classifierName) as unknown as Array<{
-      generation: number;
-      status: string;
-      trained: number;
-      model_path: string | null;
-      needle_version: string | null;
-    }>;
+    generation: number;
+    status: string;
+    trained: number;
+    model_path: string | null;
+    needle_version: string | null;
+  }>;
   if (
     generations.some(
       (generation) =>
         generation.trained !== 0 ||
         generation.model_path !== null ||
         generation.needle_version !== null,
-    ) || countRows(database, "model_artifacts", options.classifierName) > 0
+    ) ||
+    countRows(database, "model_artifacts", options.classifierName) > 0
   ) {
     blockers.push({
       code: "trained_generation",
@@ -481,7 +503,8 @@ const evidenceBlockers = (
   ) {
     blockers.push({
       code: "previous_generation",
-      message: "A previous classifier generation may have used held-out model selection",
+      message:
+        "A previous classifier generation may have used held-out model selection",
     });
   }
   if (countRows(database, "training_runs", options.classifierName) > 0) {
@@ -496,10 +519,22 @@ const evidenceBlockers = (
       message: "A candidate model, LoRA, or candidate sidecar exists on disk",
     });
   }
-  if (eligibleHeldOutCount !== totalHeldOutCount) {
+  if (legacyAdoptedAt === null) {
     blockers.push({
       code: "invalid_legacy_dataset",
-      message: "Original held-out rows are not all in the legacy validation purpose",
+      message: "Legacy adoption provenance is missing",
+    });
+  } else if (ambiguousBoundaryExampleCount > 0) {
+    blockers.push({
+      code: "invalid_legacy_dataset",
+      message: `${ambiguousBoundaryExampleCount} held-out examples share the legacy adoption timestamp and cannot be classified safely`,
+    });
+  }
+  if (eligibleHeldOutCount !== preAdoptionHeldOutCount) {
+    blockers.push({
+      code: "invalid_legacy_dataset",
+      message:
+        "Pre-adoption held-out rows are not all in the legacy validation purpose",
     });
   }
   return blockers;
@@ -643,10 +678,12 @@ const migrationOrder = (example: LegacyExample): string =>
 const heldOutGroups = (
   examples: readonly LegacyExample[],
 ): readonly LegacyHeldOutMigrationGroup[] =>
-  [...groupExamples(
-    examples,
-    (example) => `${example.result_bin}\0${example.facets_json}`,
-  ).entries()]
+  [
+    ...groupExamples(
+      examples,
+      (example) => `${example.result_bin}\0${example.facets_json}`,
+    ).entries(),
+  ]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([, group]) => ({
       resultBin: group[0]!.result_bin,
@@ -675,7 +712,10 @@ const countAssigned = (
   [...assignments.values()].filter((candidate) => candidate === purpose).length;
 
 const candidateArtifactPaths = (
-  options: Pick<LegacyHeldOutMigrationOptions, "dataDirectory" | "classifierName">,
+  options: Pick<
+    LegacyHeldOutMigrationOptions,
+    "dataDirectory" | "classifierName"
+  >,
 ): readonly string[] => {
   const classifierDirectory = join(
     options.dataDirectory,
@@ -772,13 +812,18 @@ const countExamples = (
 
 const countRows = (
   database: DatabaseSyncType,
-  table: "training_runs" | "training_evaluations" | "model_artifacts" | "shadow_evaluations",
+  table:
+    | "training_runs"
+    | "training_evaluations"
+    | "model_artifacts"
+    | "shadow_evaluations",
   classifierName: string,
 ): number => {
   if (!hasTable(database, table)) return 0;
-  const column = table === "training_evaluations" || table === "shadow_evaluations"
-    ? "training_run_id IN (SELECT id FROM training_runs WHERE classifier_name = ?)"
-    : "classifier_name = ?";
+  const column =
+    table === "training_evaluations" || table === "shadow_evaluations"
+      ? "training_run_id IN (SELECT id FROM training_runs WHERE classifier_name = ?)"
+      : "classifier_name = ?";
   return (
     database
       .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column}`)
@@ -788,9 +833,7 @@ const countRows = (
 
 const hasTable = (database: DatabaseSyncType, table: string): boolean =>
   database
-    .prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-    )
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(table) !== undefined;
 
 const readPriorMigration = (
@@ -814,6 +857,39 @@ const readPriorMigration = (
       .get(classifierName) as StoredMigration | undefined) ?? null
   );
 };
+
+const readLegacyAdoptedAt = (
+  database: DatabaseSyncType,
+  classifierName: string,
+): number | null => {
+  if (!hasTable(database, "legacy_dataset_purpose_adoptions")) return null;
+  const adoption = database
+    .prepare(
+      `
+      SELECT adopted_at FROM legacy_dataset_purpose_adoptions
+      WHERE classifier_name = ?
+    `,
+    )
+    .get(classifierName) as { adopted_at: number } | undefined;
+  return adoption?.adopted_at ?? null;
+};
+
+const readPlanExamples = (
+  database: DatabaseSyncType,
+  classifierName: string,
+  generation: number,
+): readonly unknown[] =>
+  database
+    .prepare(
+      `
+      SELECT id, generation, input, result_json, split, input_hash,
+             result_bin, purpose, facets_json, created_at
+      FROM examples
+      WHERE classifier_name = ? AND generation = ?
+      ORDER BY id
+    `,
+    )
+    .all(classifierName, generation);
 
 const validateTargets = (targets: LegacyHeldOutPurposeTargets): void => {
   for (const [purpose, target] of Object.entries(targets)) {
@@ -843,7 +919,11 @@ const hashPlan = (value: unknown): string =>
 const withoutAssignments = (
   plan: PlannedMigration,
 ): LegacyHeldOutMigrationInspection => {
-  const { assignments: _assignments, ...inspection } = plan;
+  const {
+    assignments: _assignments,
+    legacyAdoptedAt: _legacyAdoptedAt,
+    ...inspection
+  } = plan;
   return inspection;
 };
 
