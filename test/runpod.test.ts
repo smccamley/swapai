@@ -133,6 +133,7 @@ describe("runpodTrainer", () => {
     writeFileSync(privateKey, "test-key");
     const requests: Array<{ url: string; method: string; body?: unknown }> = [];
     let deleted = false;
+    let registeredKeys = ["ssh-ed25519 existing account-key"];
     const fetch = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
@@ -144,6 +145,15 @@ describe("runpodTrainer", () => {
             ? {}
             : { body: JSON.parse(String(init.body)) }),
         });
+        if (url.endsWith("/v2/account/ssh-keys") && method === "GET") {
+          return json({ keys: registeredKeys });
+        }
+        if (url.endsWith("/v2/account/ssh-keys") && method === "PUT") {
+          registeredKeys = (
+            JSON.parse(String(init?.body)) as { keys: string[] }
+          ).keys;
+          return json({ keys: registeredKeys });
+        }
         if (url.endsWith("/v2/pods") && method === "GET") {
           return json({
             pods: [],
@@ -212,6 +222,7 @@ describe("runpodTrainer", () => {
         maximumCostUsd: 1,
         maximumRuntimeMinutes: 30,
         sshPrivateKey: privateKey,
+        registerSshPublicKeyForTraining: true,
       },
       {
         fetch: fetch as typeof globalThis.fetch,
@@ -229,7 +240,7 @@ describe("runpodTrainer", () => {
           method: "POST",
           url: "https://api.runpod.io/v2/pods",
           body: expect.objectContaining({
-            image: "ghcr.io/smccamley/swapai-trainer:0.6.3",
+            image: "ghcr.io/smccamley/swapai-trainer:0.6.4",
             gpu: expect.objectContaining({
               id: "NVIDIA RTX A5000",
               count: 1,
@@ -238,6 +249,7 @@ describe("runpodTrainer", () => {
             cloud: "SECURE",
             disk: 30,
             ports: ["22/tcp"],
+            startSsh: true,
           }),
         }),
         expect.objectContaining({
@@ -247,6 +259,18 @@ describe("runpodTrainer", () => {
       ]),
     );
     expect(deleted).toBe(true);
+    expect(registeredKeys).toEqual(["ssh-ed25519 existing account-key"]);
+    const keyWrites = requests.filter(
+      ({ method, url }) =>
+        method === "PUT" && url.endsWith("/v2/account/ssh-keys"),
+    );
+    expect(keyWrites).toHaveLength(2);
+    expect(keyWrites[0]?.body).toEqual({
+      keys: ["ssh-ed25519 existing account-key", "ssh-ed25519 public"],
+    });
+    expect(keyWrites[1]?.body).toEqual({
+      keys: ["ssh-ed25519 existing account-key"],
+    });
   });
 
   it("falls back from an unreachable direct SSH endpoint to the Runpod proxy", async () => {

@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://api.runpod.io/v2";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.3";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.4";
 const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const CONTAINER_DISK_GB = 30;
 const CONTAINER_DISK_USD_PER_GB_MONTH = 0.1;
@@ -37,6 +37,8 @@ export interface RunpodTrainerOptions {
   /** @deprecated Use cloud. */
   readonly cloudType?: "SECURE";
   readonly sshPrivateKey?: string;
+  /** Register this trainer's public key before Pod creation and remove it after cleanup. */
+  readonly registerSshPublicKeyForTraining?: boolean;
 }
 
 export interface RunpodTrainerDependencies {
@@ -78,6 +80,10 @@ interface RunpodPodListResponse {
   };
 }
 
+interface RunpodSshKeysResponse {
+  readonly keys: readonly string[];
+}
+
 export const runpodTrainer = (
   options: RunpodTrainerOptions,
   dependencies: RunpodTrainerDependencies = {},
@@ -111,21 +117,40 @@ export const runpodTrainer = (
         )
       ).stdout.trim();
       if (publicKey === "") throw new Error("SSH public key is empty");
+      const removeSshPublicKey =
+        options.registerSshPublicKeyForTraining === true
+          ? await registerSshPublicKey(api, publicKey)
+          : undefined;
       const billingStartedAt = now();
       const deadline = billingStartedAt + runtimeMinutes * 60_000;
-      const pod = await createPodForFirstAvailableGpu(
-        api,
-        options.gpuTypes ?? DEFAULT_GPU_TYPES,
-        {
-          name: `swapai-${deadline}-${job.id}`,
-          cloud: options.cloud ?? options.cloudType ?? "SECURE",
-          image: options.image ?? DEFAULT_IMAGE,
-          disk: CONTAINER_DISK_GB,
-          ports: ["22/tcp"],
-          env: { SSH_PUBLIC_KEY: publicKey, PUBLIC_KEY: publicKey },
-        },
-        sleep,
-      );
+      let pod: RunpodPod;
+      try {
+        pod = await createPodForFirstAvailableGpu(
+          api,
+          options.gpuTypes ?? DEFAULT_GPU_TYPES,
+          {
+            name: `swapai-${deadline}-${job.id}`,
+            cloud: options.cloud ?? options.cloudType ?? "SECURE",
+            image: options.image ?? DEFAULT_IMAGE,
+            disk: CONTAINER_DISK_GB,
+            ports: ["22/tcp"],
+            startSsh: true,
+            env: { SSH_PUBLIC_KEY: publicKey, PUBLIC_KEY: publicKey },
+          },
+          sleep,
+        );
+      } catch (podCreationError) {
+        if (removeSshPublicKey === undefined) throw podCreationError;
+        try {
+          await removeSshPublicKey();
+        } catch (sshKeyCleanupError) {
+          throw new AggregateError(
+            [podCreationError, sshKeyCleanupError],
+            "Runpod Pod creation and temporary SSH key cleanup both failed",
+          );
+        }
+        throw podCreationError;
+      }
       let result: TrainingCandidate | undefined;
       let trainingError: unknown;
       try {
@@ -164,7 +189,13 @@ export const runpodTrainer = (
       }
       let cleanupError: unknown;
       try {
-        await deletePodAndReport(api, pod.id, sleep, lifecycle);
+        await deletePodAndReport(
+          api,
+          pod.id,
+          sleep,
+          lifecycle,
+          removeSshPublicKey,
+        );
       } catch (error) {
         cleanupError = error;
       }
@@ -542,6 +573,55 @@ const createRunpodApi = (
       request<RunpodPod>(`/pods/${id}`, {}, signal),
     deletePod: (id: string, signal?: AbortSignal) =>
       request<unknown>(`/pods/${id}`, { method: "DELETE" }, signal),
+    listSshPublicKeys: () =>
+      request<RunpodSshKeysResponse>("/account/ssh-keys"),
+    replaceSshPublicKeys: (keys: readonly string[]) =>
+      request<RunpodSshKeysResponse>("/account/ssh-keys", {
+        method: "PUT",
+        body: JSON.stringify({ keys }),
+      }),
+  };
+};
+
+const sshPublicKeyIdentity = (publicKey: string): string =>
+  publicKey.trim().split(/\s+/, 2).join(" ");
+
+const registerSshPublicKey = async (
+  api: ReturnType<typeof createRunpodApi>,
+  publicKey: string,
+): Promise<(() => Promise<void>) | undefined> => {
+  const identity = sshPublicKeyIdentity(publicKey);
+  const current = await api.listSshPublicKeys();
+  if (current.keys.some((key) => sshPublicKeyIdentity(key) === identity)) {
+    return undefined;
+  }
+  await api.replaceSshPublicKeys([...current.keys, publicKey]);
+  const registered = await api.listSshPublicKeys();
+  if (!registered.keys.some((key) => sshPublicKeyIdentity(key) === identity)) {
+    throw new Error("Runpod did not retain the temporary SSH public key");
+  }
+  return async () => {
+    const keysBeforeCleanup = await api.listSshPublicKeys();
+    if (
+      !keysBeforeCleanup.keys.some(
+        (key) => sshPublicKeyIdentity(key) === identity,
+      )
+    ) {
+      return;
+    }
+    await api.replaceSshPublicKeys(
+      keysBeforeCleanup.keys.filter(
+        (key) => sshPublicKeyIdentity(key) !== identity,
+      ),
+    );
+    const keysAfterCleanup = await api.listSshPublicKeys();
+    if (
+      keysAfterCleanup.keys.some(
+        (key) => sshPublicKeyIdentity(key) === identity,
+      )
+    ) {
+      throw new Error("Runpod did not remove the temporary SSH public key");
+    }
   };
 };
 
@@ -699,6 +779,7 @@ const deletePodAndReport = async (
   id: string,
   sleep: NonNullable<RunpodTrainerDependencies["sleep"]>,
   lifecycle: TrainingLifecycleReporter | undefined,
+  additionalCleanup?: () => Promise<void>,
 ): Promise<void> => {
   const failures: unknown[] = [];
   try {
@@ -713,16 +794,27 @@ const deletePodAndReport = async (
     deletionError = error;
     failures.push(error);
   }
+  let additionalCleanupError: unknown;
+  if (additionalCleanup !== undefined) {
+    try {
+      await additionalCleanup();
+    } catch (error) {
+      additionalCleanupError = error;
+      failures.push(error);
+    }
+  }
   try {
     lifecycle?.recordCleanup(
-      deletionError === undefined
+      deletionError === undefined && additionalCleanupError === undefined
         ? { status: "succeeded" }
         : {
             status: "failed",
-            message:
-              deletionError instanceof Error
-                ? deletionError.message
-                : String(deletionError),
+            message: [deletionError, additionalCleanupError]
+              .filter((error) => error !== undefined)
+              .map((error) =>
+                error instanceof Error ? error.message : String(error),
+              )
+              .join("; "),
           },
     );
   } catch (error) {
