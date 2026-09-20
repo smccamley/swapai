@@ -229,7 +229,7 @@ describe("runpodTrainer", () => {
           method: "POST",
           url: "https://api.runpod.io/v2/pods",
           body: expect.objectContaining({
-            image: "ghcr.io/smccamley/swapai-trainer:0.6.2",
+            image: "ghcr.io/smccamley/swapai-trainer:0.6.3",
             gpu: expect.objectContaining({
               id: "NVIDIA RTX A5000",
               count: 1,
@@ -246,6 +246,102 @@ describe("runpodTrainer", () => {
         }),
       ]),
     );
+    expect(deleted).toBe(true);
+  });
+
+  it("falls back from an unreachable direct SSH endpoint to the Runpod proxy", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "swapai-runpod-ssh-fallback-"));
+    temporaryDirectories.push(directory);
+    const privateKey = join(directory, "id_ed25519");
+    writeFileSync(privateKey, "test-key");
+    const sshAttempts: string[] = [];
+    let deleted = false;
+    const fetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.endsWith("/v2/pods") && method === "GET") {
+          return json({ pods: [] });
+        }
+        if (url.endsWith("/v2/pods") && method === "POST") {
+          return json({
+            id: "pod-ssh-fallback",
+            name: "swapai-ssh-fallback",
+            status: "PROVISIONING",
+            cost: 0.5,
+          });
+        }
+        if (
+          url.endsWith("/v2/pods/pod-ssh-fallback") &&
+          method === "DELETE"
+        ) {
+          deleted = true;
+          return json(null);
+        }
+        if (url.endsWith("/v2/pods/pod-ssh-fallback") && deleted) {
+          return new Response("not found", { status: 404 });
+        }
+        if (url.endsWith("/v2/pods/pod-ssh-fallback")) {
+          return json({
+            id: "pod-ssh-fallback",
+            name: "swapai-ssh-fallback",
+            status: "RUNNING",
+            cost: 0.5,
+            ssh: {
+              direct: {
+                host: "203.0.113.10",
+                port: 22022,
+                username: "root",
+              },
+              proxy: {
+                host: "ssh.runpod.io",
+                port: 22,
+                username: "pod-user",
+              },
+            },
+          });
+        }
+        return new Response("unexpected request", { status: 500 });
+      },
+    );
+    const runCommand = vi.fn(
+      async (command: string, args: readonly string[]) => {
+        if (command === "ssh-keygen") {
+          return { stdout: "ssh-ed25519 public", stderr: "" };
+        }
+        if (command === "ssh" && args.at(-1) === "true") {
+          const destination = args.at(-2)!;
+          sshAttempts.push(destination);
+          if (destination === "root@203.0.113.10") {
+            throw new Error("direct route is unreachable");
+          }
+          return { stdout: "", stderr: "" };
+        }
+        if (command === "scp") throw new Error("stop after SSH fallback");
+        throw new Error(`unexpected command: ${command}`);
+      },
+    );
+    const trainer = runpodTrainer(
+      {
+        apiKey: "runpod-test-key",
+        maximumCostUsd: 1,
+        maximumRuntimeMinutes: 30,
+        sshPrivateKey: privateKey,
+      },
+      {
+        fetch: fetch as typeof globalThis.fetch,
+        runCommand,
+        sleep: async () => undefined,
+      },
+    );
+
+    await expect(trainer.train(trainingJob(directory))).rejects.toThrow(
+      "stop after SSH fallback",
+    );
+    expect(sshAttempts).toEqual([
+      "root@203.0.113.10",
+      "pod-user@ssh.runpod.io",
+    ]);
     expect(deleted).toBe(true);
   });
 

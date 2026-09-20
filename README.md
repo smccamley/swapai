@@ -172,7 +172,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.2`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.3`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 
