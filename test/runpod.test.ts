@@ -188,12 +188,12 @@ describe("runpodTrainer", () => {
             status: "RUNNING",
             cost: 0.5,
             ssh: {
-              proxy: {
-                host: "ssh.runpod.io",
-                port: 22,
-                username: "pod-123-user",
+              direct: {
+                host: "203.0.113.10",
+                port: 22022,
+                username: "root",
               },
-              direct: null,
+              proxy: null,
             },
           });
         }
@@ -212,7 +212,7 @@ describe("runpodTrainer", () => {
           return { stdout: "", stderr: "" };
         }
         if (command === "scp") {
-          expect(args).toContain("-O");
+          expect(args).not.toContain("-O");
           return { stdout: "", stderr: "" };
         }
         if (command === "ssh") throw new Error("trainer exited 1");
@@ -243,7 +243,7 @@ describe("runpodTrainer", () => {
           method: "POST",
           url: "https://api.runpod.io/v2/pods",
           body: expect.objectContaining({
-            image: "ghcr.io/smccamley/swapai-trainer:0.6.5",
+            image: "ghcr.io/smccamley/swapai-trainer:0.6.6",
             gpu: expect.objectContaining({
               id: "NVIDIA RTX A5000",
               count: 1,
@@ -276,7 +276,7 @@ describe("runpodTrainer", () => {
     });
   });
 
-  it("falls back from an unreachable direct SSH endpoint to the Runpod proxy", async () => {
+  it("does not mistake Runpod basic proxy SSH for full automation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "swapai-runpod-ssh-fallback-"));
     temporaryDirectories.push(directory);
     const privateKey = join(directory, "id_ed25519");
@@ -344,7 +344,7 @@ describe("runpodTrainer", () => {
           }
           return { stdout: "", stderr: "" };
         }
-        if (command === "scp") throw new Error("stop after SSH fallback");
+        if (command === "scp") throw new Error("proxy was incorrectly selected");
         throw new Error(`unexpected command: ${command}`);
       },
     );
@@ -363,12 +363,10 @@ describe("runpodTrainer", () => {
     );
 
     await expect(trainer.train(trainingJob(directory))).rejects.toThrow(
-      "stop after SSH fallback",
+      /direct route is unreachable/,
     );
-    expect(sshAttempts).toEqual([
-      "root@203.0.113.10",
-      "pod-user@ssh.runpod.io",
-    ]);
+    expect(sshAttempts).toHaveLength(120);
+    expect(new Set(sshAttempts)).toEqual(new Set(["root@203.0.113.10"]));
     expect(deleted).toBe(true);
   });
 

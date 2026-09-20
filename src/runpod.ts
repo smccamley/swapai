@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://api.runpod.io/v2";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.5";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.6";
 const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const CONTAINER_DISK_GB = 30;
 const CONTAINER_DISK_USD_PER_GB_MONTH = 0.1;
@@ -380,23 +380,20 @@ const usePod = async (options: {
     options.sleep,
     options.signal,
   );
-  const connections = [connected.ssh?.direct, connected.ssh?.proxy].filter(
-    (connection): connection is NonNullable<typeof connection> =>
-      connection !== undefined && connection !== null,
-  );
-  if (connections.length === 0) {
-    throw new Error(`Runpod Pod ${options.pod.id} did not provide SSH details`);
+  const direct = connected.ssh?.direct;
+  if (direct === undefined || direct === null) {
+    throw new Error(`Runpod Pod ${options.pod.id} did not provide full SSH`);
   }
   const ssh = await waitForSsh(
-    connections.map((connection) =>
+    [
       sshArguments(
-        connection.host,
-        connection.port,
+        direct.host,
+        direct.port,
         options.privateKey,
         join(options.job.outputDirectory, "runpod-known-hosts"),
-        connection.username,
+        direct.username,
       ),
-    ),
+    ],
     options.runCommand,
     options.sleep,
     options.signal,
@@ -696,13 +693,15 @@ const waitForConnectablePod = async (
     }
     if (
       pod.status === "RUNNING" &&
-      ((pod.ssh?.direct !== undefined && pod.ssh.direct !== null) ||
-        (pod.ssh?.proxy !== undefined && pod.ssh.proxy !== null))
+      pod.ssh?.direct !== undefined &&
+      pod.ssh.direct !== null
     )
       return pod;
     await waitWithSignal(sleep, 5_000, signal);
   }
-  throw new Error(`Runpod Pod ${id} did not expose SSH within 12 minutes`);
+  throw new Error(
+    `Runpod Pod ${id} did not expose full SSH over its published TCP port within 12 minutes`,
+  );
 };
 
 const waitForSsh = async (
@@ -851,7 +850,7 @@ const sshArguments = (
 const scpConnectionArguments = (ssh: readonly string[]): readonly string[] => {
   const args = ssh.slice(0, -1);
   if (args[0] === "-p") args[0] = "-P";
-  return ["-O", ...args];
+  return args;
 };
 
 const resolvePrivateKey = (configured: string | undefined): string => {
