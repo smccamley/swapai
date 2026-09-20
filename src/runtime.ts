@@ -515,9 +515,16 @@ class ManagedNeedleRuntime implements NeedleRuntime {
     const environment = this.#makeEnvironment(uvPath, environmentDirectory);
 
     if (!(await exists(pythonPath))) {
+      const staleEnvironmentExists = await exists(environmentDirectory);
       await this.#runCommand(
         uvPath,
-        ["venv", "--python", PYTHON_VERSION, environmentDirectory],
+        [
+          "venv",
+          ...(staleEnvironmentExists ? ["--clear"] : []),
+          "--python",
+          PYTHON_VERSION,
+          environmentDirectory,
+        ],
         { cwd: installDirectory, env: environment, timeoutMs: 15 * 60 * 1000 },
       );
     }

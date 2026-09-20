@@ -197,6 +197,35 @@ describe("managed Needle runtime", () => {
     await second.close();
   });
 
+  it("replaces a stale virtual environment whose Python executable is missing", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-stale-venv-"));
+    const environmentDirectory = join(
+      dataDirectory,
+      "runtime",
+      `needle-${NEEDLE_VERSION}`,
+      ".venv",
+    );
+    await mkdir(environmentDirectory, { recursive: true });
+    await writeFile(join(environmentDirectory, "pyvenv.cfg"), "stale");
+
+    const fake = await makeFakeCommands(dataDirectory);
+    const runtime = createNeedleRuntime({
+      dataDirectory,
+      dependencies: { runCommand: fake.runCommand },
+    });
+
+    await runtime.ready();
+
+    expect(fake.calls.find((call) => call.args[0] === "venv")?.args).toEqual([
+      "venv",
+      "--clear",
+      "--python",
+      "3.12",
+      environmentDirectory,
+    ]);
+    await runtime.close();
+  });
+
   it("writes Needle JSONL and trains a .cact in the classifier generation", async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "swapai-train-"));
     const fake = await makeFakeCommands(dataDirectory);
