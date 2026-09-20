@@ -141,15 +141,19 @@ const migration = migrateLegacyHeldOutExamples({
 });
 ```
 
-The command holds an exclusive database transaction, rechecks the reviewed
-plan hash, preserves every original `training` row, and changes only original
-`held_out` rows. It blocks active runtimes, completed evaluations, provider
-runs, trained or previous generations, indexed artifacts, and candidate model,
-LoRA, or sidecar files. A failed attempt's `training.jsonl` and shared base
-checkpoint do not prove held-out evaluation. The plan validates configured
-minimums and allocates deterministically across result-bin and facet groups.
-The operator, reason, targets, counts, and plan digest are stored durably;
-repeating the command returns `already_migrated`.
+The command uses the durable legacy-adoption timestamp to select only original
+pre-adoption `held_out` validation rows. Targets must total that eligible count,
+not newer protected data. It holds an exclusive database transaction, rechecks
+the reviewed plan hash, preserves every `training` row, and leaves every newer
+validation, representative, and coverage row unchanged. A missing timestamp or
+a held-out row exactly on its boundary is ambiguous and blocks the migration.
+It also blocks active runtimes, completed evaluations, provider runs, trained
+or previous generations, indexed artifacts, and candidate model, LoRA, or
+sidecar files. A failed attempt's `training.jsonl` and shared base checkpoint do
+not prove held-out evaluation. The plan validates configured minimums and
+allocates deterministically across result-bin and facet groups. The operator,
+reason, targets, counts, and plan digest are stored durably; repeating the
+command returns `already_migrated`.
 
 When `maxTrainingSet` is reached, retention balances result bin, purpose, and
 facet groups rather than keeping only recent majority traffic.
@@ -168,7 +172,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.1`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.2`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 
