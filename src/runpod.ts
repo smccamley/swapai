@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const RUNPOD_API = "https://api.runpod.io/v2";
-const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.4";
+const DEFAULT_IMAGE = "ghcr.io/smccamley/swapai-trainer:0.6.5";
 const CLEANUP_HEADROOM_MS = 5 * 60_000;
 const CONTAINER_DISK_GB = 30;
 const CONTAINER_DISK_USD_PER_GB_MONTH = 0.1;
@@ -851,7 +851,7 @@ const sshArguments = (
 const scpConnectionArguments = (ssh: readonly string[]): readonly string[] => {
   const args = ssh.slice(0, -1);
   if (args[0] === "-p") args[0] = "-P";
-  return args;
+  return ["-O", ...args];
 };
 
 const resolvePrivateKey = (configured: string | undefined): string => {
