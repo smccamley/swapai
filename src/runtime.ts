@@ -597,6 +597,7 @@ class ManagedNeedleRuntime implements NeedleRuntime {
       DO_NOT_TRACK: "1",
       HF_HOME: join(this.#runtimeDirectory, "huggingface"),
       UV_CACHE_DIR: join(this.#runtimeDirectory, "uv-cache"),
+      UV_PYTHON_INSTALL_DIR: join(this.#runtimeDirectory, "uv-python"),
       XDG_CACHE_HOME: join(this.#runtimeDirectory, "cache"),
     };
   }

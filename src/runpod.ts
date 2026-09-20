@@ -199,20 +199,29 @@ export const runpodTrainer = (
       } catch (error) {
         cleanupError = error;
       }
-      if (trainingError !== undefined && cleanupError !== undefined) {
+      const costUsd =
+        (totalHourlyPodCost(pod.cost) *
+          Math.max(0, now() - billingStartedAt)) /
+        3_600_000;
+      let costEvidenceError: unknown;
+      try {
+        lifecycle?.recordCost?.({ costUsd });
+      } catch (error) {
+        costEvidenceError = error;
+      }
+      const failures = [trainingError, cleanupError, costEvidenceError].filter(
+        (error) => error !== undefined,
+      );
+      if (failures.length > 1) {
         throw new AggregateError(
-          [trainingError, cleanupError],
-          "Runpod training and Pod cleanup both failed",
+          failures,
+          "Runpod training, cost evidence, or Pod cleanup failed",
         );
       }
-      if (trainingError !== undefined) throw trainingError;
-      if (cleanupError !== undefined) throw cleanupError;
+      if (failures.length === 1) throw failures[0];
       return {
         ...result!,
-        costUsd:
-          (totalHourlyPodCost(pod.cost) *
-            Math.max(0, now() - billingStartedAt)) /
-          3_600_000,
+        costUsd,
       };
     },
     cancel: async (run, lifecycle) => {
