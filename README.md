@@ -27,6 +27,7 @@ const relevance = createClassifier({
     maximumCostUsd: 1,
     maximumRuntimeMinutes: 30,
     sshPrivateKey: process.env.SWAPAI_RUNPOD_SSH_PRIVATE_KEY,
+    registerSshPublicKeyForTraining: true,
   }),
 });
 
@@ -172,7 +173,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.3`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.4`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 
@@ -181,7 +182,11 @@ await relevance.reconcileTraining();
 ```
 
 Runpod authentication uses `RUNPOD_API_KEY`. SSH uses the configured private
-key; the corresponding public key is injected only into the temporary Pod.
+key. Set `registerSshPublicKeyForTraining: true` when the key is not already on
+the Runpod account. SwapAI then adds that exact public key before Pod creation,
+enables Runpod's `startSsh` path, preserves every existing account key, and
+removes only the key it added after verified Pod cleanup. Registration failure
+happens before a paid Pod exists.
 
 ## Local and custom providers
 

@@ -63,7 +63,9 @@ guarantee the SSH route this protocol needs. It supports both Runpod proxy SSH
 and direct SSH, constrains placement to CUDA 12.8 or newer, aborts bounded HTTP
 and child-process work, and follows every list page during orphan recovery.
 Its paid deadline includes reported compute, conservative container-storage
-cost, and deletion headroom.
+cost, and deletion headroom. When temporary SSH-key registration is enabled,
+the adapter registers the exact derived public key before Pod creation and
+removes only that key as part of the same reported cleanup boundary.
 
 Attempted legacy datasets use a separate two-phase administrative boundary.
 Inspection uses the durable legacy-adoption timestamp to identify pre-adoption
