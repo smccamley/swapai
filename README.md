@@ -173,7 +173,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.4`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.5`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 
@@ -186,7 +186,9 @@ key. Set `registerSshPublicKeyForTraining: true` when the key is not already on
 the Runpod account. SwapAI then adds that exact public key before Pod creation,
 enables Runpod's `startSsh` path, preserves every existing account key, and
 removes only the key it added after verified Pod cleanup. Registration failure
-happens before a paid Pod exists.
+happens before a paid Pod exists. File transfers force the legacy SCP protocol
+because Runpod's proxy SSH endpoint does not provide the SFTP subsystem used by
+modern `scp` by default.
 
 ## Local and custom providers
 

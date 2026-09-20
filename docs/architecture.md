@@ -60,7 +60,8 @@ see or return.
 
 The Runpod adapter is Secure-Cloud-only because Community Cloud cannot
 guarantee the SSH route this protocol needs. It supports both Runpod proxy SSH
-and direct SSH, constrains placement to CUDA 12.8 or newer, aborts bounded HTTP
+and direct SSH, forces legacy SCP transport because the proxy omits SFTP,
+constrains placement to CUDA 12.8 or newer, aborts bounded HTTP
 and child-process work, and follows every list page during orphan recovery.
 Its paid deadline includes reported compute, conservative container-storage
 cost, and deletion headroom. When temporary SSH-key registration is enabled,

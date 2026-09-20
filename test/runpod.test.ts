@@ -211,7 +211,10 @@ describe("runpodTrainer", () => {
         if (command === "ssh" && args.at(-1) === "true") {
           return { stdout: "", stderr: "" };
         }
-        if (command === "scp") return { stdout: "", stderr: "" };
+        if (command === "scp") {
+          expect(args).toContain("-O");
+          return { stdout: "", stderr: "" };
+        }
         if (command === "ssh") throw new Error("trainer exited 1");
         throw new Error(`unexpected command: ${command}`);
       },
@@ -240,7 +243,7 @@ describe("runpodTrainer", () => {
           method: "POST",
           url: "https://api.runpod.io/v2/pods",
           body: expect.objectContaining({
-            image: "ghcr.io/smccamley/swapai-trainer:0.6.4",
+            image: "ghcr.io/smccamley/swapai-trainer:0.6.5",
             gpu: expect.objectContaining({
               id: "NVIDIA RTX A5000",
               count: 1,
