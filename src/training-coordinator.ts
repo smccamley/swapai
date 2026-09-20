@@ -61,16 +61,31 @@ export const evaluateCandidate = async (options: {
   const predictions: CandidatePrediction[] = [];
   try {
     for (const example of protectedTests) {
-      predictions.push({
+      const reference = validateResult(options.job.result, example.result);
+      const prediction = {
         input: example.input,
         purpose: example.purpose,
         resultBin: example.resultBin,
-        reference: validateResult(options.job.result, example.result),
-        candidate: validateResult(
-          options.job.result,
-          await model.classify(example.input),
-        ),
-      });
+        reference,
+      };
+      try {
+        predictions.push({
+          ...prediction,
+          candidate: validateResult(
+            options.job.result,
+            await model.classify(example.input),
+          ),
+        });
+      } catch (error) {
+        if (!(error instanceof SwapAIError) || error.code !== "classification_failed") {
+          throw error;
+        }
+        predictions.push({
+          ...prediction,
+          candidate: reference,
+          classificationFailed: true,
+        });
+      }
     }
   } finally {
     await model.close().catch(() => undefined);

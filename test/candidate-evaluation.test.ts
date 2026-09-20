@@ -3,6 +3,49 @@ import { describe, expect, it } from "vitest";
 import { evaluateCandidatePredictions } from "../src/candidate-evaluation.js";
 
 describe("candidate promotion evidence", () => {
+  it("counts a missing Needle classification as complete error", () => {
+    const predictions = [
+      {
+        purpose: "validation" as const,
+        resultBin: "false",
+        reference: false,
+        candidate: false,
+        classificationFailed: true,
+        input: "missing-call",
+      },
+      {
+        purpose: "representative_test" as const,
+        resultBin: "false",
+        reference: false,
+        candidate: false,
+        input: "classified",
+      },
+      {
+        purpose: "coverage_test" as const,
+        resultBin: "false",
+        reference: false,
+        candidate: false,
+        input: "covered",
+      },
+    ];
+
+    const evidence = evaluateCandidatePredictions(
+      { type: "boolean" },
+      0.1,
+      predictions,
+    );
+
+    expect(evidence.metrics).toContainEqual({
+      purpose: "validation",
+      resultBin: null,
+      exampleCount: 1,
+      error: 1,
+      passed: false,
+    });
+    expect(evidence.passed).toBe(false);
+    expect(evidence.maximumError).toBe(1);
+  });
+
   it("rejects a low constant prediction even when its aggregate error looks good", () => {
     const predictions = [
       {

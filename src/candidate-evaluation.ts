@@ -1,4 +1,4 @@
-import { averageError } from "./evaluation.js";
+import { resultError } from "./evaluation.js";
 import type {
   ResultComparison,
   ResultConfig,
@@ -9,6 +9,7 @@ export interface CandidatePrediction extends ResultComparison<ResultValue> {
   readonly input: string;
   readonly purpose: "validation" | "representative_test" | "coverage_test";
   readonly resultBin: string;
+  readonly classificationFailed?: boolean;
 }
 
 export interface CandidateEvaluationMetric {
@@ -76,7 +77,14 @@ const measure = (
   resultBin: string | null,
   predictions: readonly CandidatePrediction[],
 ): CandidateEvaluationMetric => {
-  const error = averageError(result, predictions);
+  const error = predictions.reduce(
+    (total, prediction) => total + (
+      prediction.classificationFailed
+        ? 1
+        : resultError(result, prediction.reference, prediction.candidate)
+    ),
+    0,
+  ) / predictions.length;
   return {
     purpose,
     resultBin,
