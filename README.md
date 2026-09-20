@@ -161,8 +161,8 @@ facet groups rather than keeping only recent majority traffic.
 
 ## Runpod
 
-`runpodTrainer()` uses Runpod REST API v2 and Secure Cloud only. It accepts the
-API's proxy or direct SSH connection, requires a CUDA 12.8-or-newer host, and
+`runpodTrainer()` uses Runpod REST API v2 and Secure Cloud only. It requires the
+Pod's full SSH connection over its published TCP port and a CUDA 12.8-or-newer host. Runpod's basic proxy SSH is interactive-only and is not treated as a usable automation endpoint. The adapter
 creates one Pod after documented per-GPU placement retries. HTTP requests and
 child processes are abortable; terminal Pod states fail immediately. Recovery
 walks every API page, records the Pod ID immediately, and verifies termination
@@ -173,7 +173,7 @@ storage, and reserves five minutes for verified deletion inside the earlier of
 the runtime and cost limits.
 
 The default image is
-`ghcr.io/smccamley/swapai-trainer:0.6.5`. The image pins
+`ghcr.io/smccamley/swapai-trainer:0.6.6`. The image pins
 `cactus-needle[train,gpu]` 2.0.14. Numeric artifacts report
 `2.0.14/number-buckets-v1`.
 
@@ -186,9 +186,9 @@ key. Set `registerSshPublicKeyForTraining: true` when the key is not already on
 the Runpod account. SwapAI then adds that exact public key before Pod creation,
 enables Runpod's `startSsh` path, preserves every existing account key, and
 removes only the key it added after verified Pod cleanup. Registration failure
-happens before a paid Pod exists. File transfers force the legacy SCP protocol
-because Runpod's proxy SSH endpoint does not provide the SFTP subsystem used by
-modern `scp` by default.
+happens before a paid Pod exists. The Pod exposes `22/tcp`; SwapAI waits for
+Runpod to publish full direct SSH before it transfers the verified bundle or
+runs the trainer. Basic proxy SSH is never used for commands or file transfer.
 
 ## Local and custom providers
 
