@@ -662,6 +662,7 @@ describe("managed Needle runtime", () => {
       DO_NOT_TRACK: "1",
       HF_HOME: join(dataDirectory, "runtime", "huggingface"),
       UV_CACHE_DIR: join(dataDirectory, "runtime", "uv-cache"),
+      UV_PYTHON_INSTALL_DIR: join(dataDirectory, "runtime", "uv-python"),
     });
     expect(environment?.PATH?.split(delimiter)).toBeDefined();
     await runtime.close();

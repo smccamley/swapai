@@ -81,6 +81,12 @@ export const createClassifier = <
         cleanupStatus: status,
         cleanupMessage: message ?? null,
       }),
+    recordCost: ({ costUsd }) =>
+      recordTrainingLifecycle({
+        dataDirectory,
+        trainingRunId,
+        costUsd,
+      }),
   });
 
   const inspect = () => readClassifierInspection({

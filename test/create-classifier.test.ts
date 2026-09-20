@@ -1254,7 +1254,9 @@ describe("createClassifier", () => {
 
   it("hands only frozen training examples to a trainer", async () => {
     const receivedJobs: TrainingJob[] = [];
-    const expectedFailure = new Error("stop after inspecting the handoff");
+    const expectedFailure = new Error("stop after inspecting the handoff", {
+      cause: new Error("provider stderr explains the failure"),
+    });
     const training: TrainingProvider = {
       name: "recording-trainer",
       train: async (job, lifecycle) => {
@@ -1267,6 +1269,7 @@ describe("createClassifier", () => {
           status: "failed",
           message: "machine did not terminate",
         });
+        lifecycle?.recordCost?.({ costUsd: 0.42 });
         throw expectedFailure;
       },
     };
@@ -1314,8 +1317,10 @@ describe("createClassifier", () => {
       provider: "recording-trainer",
       status: "failed",
       datasetRevisionId: receivedJobs[0]!.datasetRevisionId,
-      failureMessage: "stop after inspecting the handoff",
+      failureMessage:
+        "stop after inspecting the handoff; caused by: provider stderr explains the failure",
       providerRunId: "provider-run-failed",
+      costUsd: 0.42,
       resources: [{ type: "test-machine", id: "machine-1" }],
       cleanup: {
         status: "failed",

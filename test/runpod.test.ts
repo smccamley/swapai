@@ -359,15 +359,26 @@ describe("runpodTrainer", () => {
         fetch: fetch as typeof globalThis.fetch,
         runCommand,
         sleep: async () => undefined,
+        now: (() => {
+          let milliseconds = 0;
+          return () => (milliseconds += 60_000);
+        })(),
       },
     );
 
-    await expect(trainer.train(trainingJob(directory))).rejects.toThrow(
-      /direct route is unreachable/,
-    );
+    const costs: number[] = [];
+    await expect(
+      trainer.train(trainingJob(directory), {
+        recordProviderRun: () => undefined,
+        recordCleanup: () => undefined,
+        recordCost: ({ costUsd }) => costs.push(costUsd),
+      }),
+    ).rejects.toThrow(/direct route is unreachable/);
     expect(sshAttempts).toHaveLength(120);
     expect(new Set(sshAttempts)).toEqual(new Set(["root@203.0.113.10"]));
     expect(deleted).toBe(true);
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toBeGreaterThan(0);
   });
 
   it("moves to the next GPU after a pool-specific forbidden response", async () => {

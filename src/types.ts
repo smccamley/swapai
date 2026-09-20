@@ -170,6 +170,7 @@ export interface TrainingLifecycleReporter {
     readonly status: Exclude<TrainingCleanupStatus, "not_required">;
     readonly message?: string;
   }): void;
+  recordCost?(details: { readonly costUsd: number }): void;
 }
 
 export interface TrainingReconciliationResult {

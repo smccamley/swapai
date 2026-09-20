@@ -358,10 +358,26 @@ export const recordTrainingFailure = (options: {
 }): void => {
   updateTrainingRun(options.dataDirectory, options.trainingRunId, {
     status: "failed",
-    failureMessage: options.error instanceof Error
-      ? options.error.message
-      : String(options.error),
+    failureMessage: trainingFailureMessage(options.error),
   });
+};
+
+const trainingFailureMessage = (failure: unknown): string => {
+  const messages: string[] = [];
+  const visited = new Set<unknown>();
+  let current: unknown = failure;
+  while (current !== undefined && current !== null && messages.length < 6) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    const message = current instanceof Error ? current.message : String(current);
+    const normalized = message.replace(/\s+/g, " ").trim();
+    if (normalized !== "" && messages.at(-1) !== normalized) messages.push(normalized);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return messages
+    .map((message, index) => index === 0 ? message : `caused by: ${message}`)
+    .join("; ")
+    .slice(0, 2_000);
 };
 
 export const updateTrainingRun = (
@@ -404,6 +420,7 @@ export const recordTrainingLifecycle = (options: {
   readonly trainingRunId: string;
   readonly providerRunId?: string;
   readonly resources?: readonly TrainingResource[];
+  readonly costUsd?: number;
   readonly cleanupStatus?: TrainingCleanupStatus;
   readonly cleanupMessage?: string | null;
 }): void => {
@@ -415,6 +432,7 @@ export const recordTrainingLifecycle = (options: {
       UPDATE training_runs
       SET provider_run_id = COALESCE(?, provider_run_id),
           resources_json = COALESCE(?, resources_json),
+          cost_usd = COALESCE(?, cost_usd),
           cleanup_status = COALESCE(?, cleanup_status),
           cleanup_message = CASE
             WHEN ? IS NULL THEN cleanup_message
@@ -424,6 +442,7 @@ export const recordTrainingLifecycle = (options: {
     `).run(
       options.providerRunId ?? null,
       options.resources === undefined ? null : JSON.stringify(options.resources),
+      options.costUsd ?? null,
       options.cleanupStatus ?? null,
       options.cleanupMessage === undefined ? null : 1,
       options.cleanupMessage ?? null,
